@@ -1,0 +1,246 @@
+name: "KAN-43 | HomeCloud Media Gateway - CI/CD"
+
+# Every push to main produces an independent build and GitHub pre-release.
+on:
+  push:
+    branches:
+      - main
+
+# Read-only by default; only the publishing job can create Releases.
+permissions:
+  contents: read
+
+# Deliberately no shared concurrency group: every pushed commit must get a run.
+
+jobs:
+  prepare:
+    name: "1. Validate Go project"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Go from go.mod with cache
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Show Go toolchain
+        run: go version
+
+      - name: Verify downloaded Go modules
+        run: go mod verify
+
+      - name: Check go.mod / go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+  windows:
+    name: "2A. Build Windows AMD64"
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+      OUTPUT_NAME: HomeCloudMediaGateway-windows-amd64.exe
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Go with Windows cache
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          go build -trimpath -ldflags="-s -w" -o "dist/$env:OUTPUT_NAME" ./cmd/media-gateway
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Go build failed' }
+
+          $bin = "dist/$env:OUTPUT_NAME"
+          if (-not (Test-Path $bin) -or (Get-Item $bin).Length -eq 0) {
+            throw 'Windows executable missing or empty'
+          }
+
+      - name: Generate Windows SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "dist/$env:OUTPUT_NAME"
+          $hash = (Get-FileHash -Path $bin -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:OUTPUT_NAME" | Set-Content -Path "$bin.sha256" -Encoding ascii
+          Write-Host "Windows SHA-256: $hash"
+
+      - name: Upload Windows binary and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: media-gateway-windows-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: "2B. Build Linux AMD64"
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+      OUTPUT_NAME: HomeCloudMediaGateway-linux-amd64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Go with Linux cache
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Linux executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/$OUTPUT_NAME" ./cmd/media-gateway
+          test -s "dist/$OUTPUT_NAME"
+          chmod +x "dist/$OUTPUT_NAME"
+
+      - name: Generate Linux SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "$OUTPUT_NAME" > "$OUTPUT_NAME.sha256"
+          cat "$OUTPUT_NAME.sha256"
+
+      - name: Upload Linux binary and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: media-gateway-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: "3. Verify SHA-256 and publish GitHub Release"
+    needs:
+      - windows
+      - linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows build
+        uses: actions/download-artifact@v7
+        with:
+          name: media-gateway-windows-amd64
+          path: downloaded/windows
+
+      - name: Download Linux build
+        uses: actions/download-artifact@v7
+        with:
+          name: media-gateway-linux-amd64
+          path: downloaded/linux
+
+      - name: Validate binaries, checksums and executable headers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LINUX="HomeCloudMediaGateway-linux-amd64"
+          WINDOWS="HomeCloudMediaGateway-windows-amd64.exe"
+
+          # Exactly one executable plus one checksum file per build.
+          test "$(find downloaded/linux -maxdepth 1 -type f | wc -l)" -eq 2
+          test "$(find downloaded/windows -maxdepth 1 -type f | wc -l)" -eq 2
+
+          (
+            cd downloaded/linux
+            sha256sum -c "$LINUX.sha256"
+            test -s "$LINUX"
+            test "$(od -An -tx1 -N4 "$LINUX" | tr -d ' \n')" = "7f454c46"
+          )
+
+          (
+            cd downloaded/windows
+            sha256sum -c "$WINDOWS.sha256"
+            test -s "$WINDOWS"
+            test "$(od -An -tx1 -N2 "$WINDOWS" | tr -d ' \n')" = "4d5a"
+          )
+
+          mkdir -p release-assets
+          cp "downloaded/linux/$LINUX" release-assets/
+          cp "downloaded/windows/$WINDOWS" release-assets/
+          chmod +x "release-assets/$LINUX"
+
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 2
+
+      - name: Prepare release notes with checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated **HomeCloud Media Gateway** build from \`main\`."
+            echo
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Target platforms: Windows x64 and Linux x64"
+            echo "- Build: Go version from \`go.mod\`, CGO disabled"
+            echo
+            echo "### SHA-256 checksums"
+            echo '```text'
+            cat downloaded/windows/*.sha256
+            cat downloaded/linux/*.sha256
+            echo '```'
+            echo
+            echo "For Linux, run \`chmod +x HomeCloudMediaGateway-linux-amd64\` after downloading."
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Publish release for this commit
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.sha }}
+          name: "HomeCloud Media Gateway | build ${{ github.sha }}"
+          target_commitish: ${{ github.sha }}
+          body_path: release_notes.md
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/HomeCloudMediaGateway-windows-amd64.exe
+            release-assets/HomeCloudMediaGateway-linux-amd64
+
+      - name: Show release URL
+        shell: bash
+        env:
+          RELEASE_URL: ${{ steps.publish.outputs.url }}
+        run: |
+          echo "Published: $RELEASE_URL"
+          echo "### GitHub Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
