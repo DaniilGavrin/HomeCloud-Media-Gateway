@@ -14,14 +14,31 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/config"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/control"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/netbind"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 )
 
 type App struct {
-	cfg    config.Config
-	logger *slog.Logger
+	cfg         config.Config
+	logger      *slog.Logger
+	roomManager *rooms.Manager
 }
 
-func New(cfg config.Config, logger *slog.Logger) *App { return &App{cfg: cfg, logger: logger} }
+func New(cfg config.Config, logger *slog.Logger) *App {
+    limit := cfg.Limits.MaxRooms
+    if limit == 0 {
+        // Existing Handler-only unit tests create minimal, non-validated configs.
+        limit = 1
+    }
+    manager, err := rooms.New(limit)
+    if err != nil {
+        panic("app.New requires validated limits.max_rooms: " + err.Error())
+    }
+    return &App{cfg: cfg, logger: logger, roomManager: manager}
+}
+
+// Rooms returns Gateway-local state only. HC WS Backend is authoritative.
+// KAN-47 will route validated Backend commands through this manager.
+func (a *App) Rooms() *rooms.Manager { return a.roomManager }
 
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
@@ -40,6 +57,7 @@ func (a *App) Handler() http.Handler {
 // Run binds only concrete allowed private interfaces, then registers addresses
 // of the successfully bound LAN/Tailscale sockets with the local Backend.
 func (a *App) Run(ctx context.Context) error {
+	defer a.roomManager.Close() // stop local room/playback workers on any exit
 	discovered, err := netbind.Discover(a.cfg.Server.Host, a.cfg.Server.Port)
 	if err != nil {
 		return fmt.Errorf("private interface discovery: %w", err)
