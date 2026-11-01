@@ -2,33 +2,42 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
+	"syscall"
+
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/app"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/config"
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	configPath := flag.String("config", "config/config.yaml", "path to Media Gateway YAML settings")
+	flag.Parse()
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		logger.Error("Failed to load startup configuration", "error", err)
+		return 1
+	}
 
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-	)
-	defer stop()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	logger.Info("HomeCloud Media Gateway starting")
+	logger.Info("HomeCloud Media Gateway starting", "config", *configPath)
+	logger.Info("Backend endpoint configured (not yet connected)", "backend_ws_url", cfg.Backend.WebSocketURL)
 
-	// TODO: Load YAML configuration.
-	// TODO: Initialize application components.
-	// TODO: Connect to HomeCloud WS Backend.
-	// TODO: Start Media WebSocket listener.
-
-	logger.Info("HomeCloud Media Gateway started")
-
-	// Keep the process alive until interrupted.
-	<-ctx.Done()
-
-	logger.Info("HomeCloud Media Gateway shutting down")
+	service := app.New(cfg, logger)
+	if err := service.Run(ctx); err != nil {
+		logger.Error("HomeCloud Media Gateway stopped with error", "error", err)
+		return 1
+	}
 	logger.Info("HomeCloud Media Gateway stopped")
+	return 0
 }

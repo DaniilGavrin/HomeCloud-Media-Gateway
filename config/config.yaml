@@ -1,0 +1,28 @@
+# HomeCloud Media Gateway — startup settings only.
+# Rooms, TV devices, playbacks and runtime state MUST NOT be stored here.
+config_version: 1
+
+server:
+  # Loopback for local development. Use an explicit private LAN/Tailscale IP
+  # when the TV Player needs to connect from another device.
+  host: "127.0.0.1"
+  port: 8091
+  websocket_path: "/ws/stream"
+  shutdown_timeout: "10s"
+
+backend:
+  # The WebSocket endpoint of HomeCloud WS Backend on this host.
+  websocket_url: "ws://127.0.0.1:8080/ws"
+
+heartbeat:
+  interval: "20s"
+  grace: "10s"
+
+storage:
+  # Relative to the process working directory, not the YAML directory.
+  cache_dir: "data/media-cache"
+  prefetch_limit_bytes: 1073741824  # 1 GiB, disk, not RAM
+  max_cache_bytes: 10737418240     # 10 GiB, planned quota
+
+limits:
+  max_rooms: 4
