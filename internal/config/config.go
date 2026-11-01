@@ -148,6 +148,9 @@ func (c Config) Validate() error {
 }
 
 func validateBindHost(value string) error {
+	if value == "auto_private" {
+		return nil
+	}
 	host, err := netip.ParseAddr(value)
 	if err != nil {
 		return errors.New("use an explicit IP address, e.g. 127.0.0.1, 192.168.x.x, or Tailscale IP")

@@ -36,7 +36,7 @@ func run() int {
 		watchSupervisorPipe(os.Stdin, cancel)
 	}
 	logger.Info("HomeCloud Media Gateway starting", "config", *configPath, "supervised", *supervised)
-	logger.Info("Backend endpoint configured (not yet connected)", "backend_ws_url", cfg.Backend.WebSocketURL)
+	logger.Info("Backend control endpoint configured", "backend_ws_url", cfg.Backend.WebSocketURL)
 
 	service := app.New(cfg, logger)
 	if err := service.Run(ctx); err != nil {
