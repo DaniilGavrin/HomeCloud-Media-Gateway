@@ -24,6 +24,7 @@ type App struct {
 	roomManager   *rooms.Manager
 	tickets       *directws.Book
 	attachUpdates chan directws.Update
+	streamOpener  directws.StreamOpener
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -44,6 +45,10 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 func (a *App) Rooms() *rooms.Manager   { return a.roomManager }
 func (a *App) Tickets() *directws.Book { return a.tickets }
 
+// SetStreamOpener installs a trusted, in-process media source before Run.
+// No source is installed by default; KAN-48 attaches stay handshake-only.
+func (a *App) SetStreamOpener(opener directws.StreamOpener) { a.streamOpener = opener }
+
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -52,7 +57,7 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive", "service": "homecloud-media-gateway"})
 	})
-	handler := &directws.Handler{Book: a.tickets, Log: a.logger, Report: func(u directws.Update) {
+	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: a.streamOpener, Report: func(u directws.Update) {
 		select {
 		case a.attachUpdates <- u:
 		default:

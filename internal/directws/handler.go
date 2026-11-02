@@ -10,15 +10,24 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediaframe"
 	"github.com/coder/websocket"
 )
 
 const HandshakeTimeout = 10 * time.Second
 
+// StreamOpener is a trusted, in-process media source. It must authorize the
+// given lease and return an independently closable reader.
+type StreamOpener func(context.Context, Lease) (io.ReadCloser, error)
+
 type Handler struct {
 	Book   *Book
 	Log    *slog.Logger
 	Report func(Update)
+	// OpenStream is an INTERNAL source provider supplied by a future storage/codec
+	// integration. Never accept arbitrary file paths or source URLs from TV.
+	// A nil provider preserves the KAN-48 handshake-only behaviour.
+	OpenStream StreamOpener
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -121,13 +130,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	conn.SetReadLimit(4096) // KAN-49 will add bounded HCM1 frame handling.
+	conn.SetReadLimit(4096)
+	if h.OpenStream != nil && hello.Capabilities["hcm1"] == true {
+		h.serveStream(r.Context(), conn, lease)
+		return
+	}
+	// An older TV or a Gateway without a source provider can still attach and
+	// remain READY. Never start sending data without explicit HCM1 capability.
 	for {
 		kind, _, err := conn.Read(r.Context())
 		if err != nil {
 			return
 		}
-		// KAN-48 deliberately accepts no media payload/control writes after hello.
+		// Handshake-only clients have no media protocol negotiated.
 		if kind == websocket.MessageBinary {
 			reject(conn, "UNSUPPORTED_VERSION")
 			return
@@ -144,4 +159,55 @@ func reject(conn *websocket.Conn, code string) {
 	_ = conn.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"media.error","code":"`+code+`","retryable":false}`))
 	cancel()
 	_ = conn.Close(websocket.StatusPolicyViolation, code)
+}
+
+// serveStream retains one outbound media writer. The receive loop only parses
+// cumulative ACKs, so an untrusted TV cannot choose a file or control playback.
+// STOP/switch revokes the lease via Book, which closes the socket and context.
+func (h *Handler) serveStream(parent context.Context, conn *websocket.Conn, lease Lease) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	source, err := h.OpenStream(ctx, lease)
+	if err != nil || source == nil {
+		if source != nil {
+			_ = source.Close()
+		}
+		reject(conn, "SOURCE_UNAVAILABLE")
+		return
+	}
+	id := mediaframe.Identity{RoomID: lease.RoomID, PlaybackID: lease.PlaybackID, Generation: lease.Generation, Epoch: lease.Epoch}
+	sender := mediaframe.NewSender(id)
+	done := make(chan error, 1)
+	go func() {
+		err := sender.Run(ctx, source, func(writeCtx context.Context, raw []byte) error {
+			return conn.Write(writeCtx, websocket.MessageBinary, raw)
+		})
+		done <- err
+		if err != nil {
+			conn.CloseNow()
+		}
+	}()
+	for {
+		kind, raw, readErr := conn.Read(ctx)
+		if readErr != nil {
+			break
+		}
+		if kind != websocket.MessageText || len(raw) > 4096 {
+			break
+		}
+		var ack mediaframe.Ack
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if dec.Decode(&ack) != nil || !errors.Is(dec.Decode(new(any)), io.EOF) || sender.Acknowledge(ack) != nil {
+			break
+		}
+	}
+	cancel()
+	// The only writer exits before the socket is closed. A non-cooperative
+	// source cannot hold the HTTP handler forever.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		conn.CloseNow()
+	}
 }
