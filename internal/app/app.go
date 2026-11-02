@@ -13,14 +13,17 @@ import (
 
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/config"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/control"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/netbind"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 )
 
 type App struct {
-	cfg         config.Config
-	logger      *slog.Logger
-	roomManager *rooms.Manager
+	cfg           config.Config
+	logger        *slog.Logger
+	roomManager   *rooms.Manager
+	tickets       *directws.Book
+	attachUpdates chan directws.Update
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -33,12 +36,13 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 	if err != nil {
 		panic("app.New requires validated limits.max_rooms: " + err.Error())
 	}
-	return &App{cfg: cfg, logger: logger, roomManager: manager}
+	return &App{cfg: cfg, logger: logger, roomManager: manager, tickets: directws.New(limit), attachUpdates: make(chan directws.Update, 1024)}
 }
 
 // Rooms returns Gateway-local state only. HC WS Backend is authoritative.
 // KAN-47 will route validated Backend commands through this manager.
-func (a *App) Rooms() *rooms.Manager { return a.roomManager }
+func (a *App) Rooms() *rooms.Manager   { return a.roomManager }
+func (a *App) Tickets() *directws.Book { return a.tickets }
 
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
@@ -48,9 +52,14 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive", "service": "homecloud-media-gateway"})
 	})
-	mux.HandleFunc("GET "+a.cfg.Server.WebSocketPath, func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "media WebSocket is not implemented yet (MG-08)", http.StatusNotImplemented)
-	})
+	handler := &directws.Handler{Book: a.tickets, Log: a.logger, Report: func(u directws.Update) {
+		select {
+		case a.attachUpdates <- u:
+		default:
+			a.logger.Warn("Direct TV attach status queue full", "room_id", u.RoomID)
+		}
+	}}
+	mux.Handle("GET "+a.cfg.Server.WebSocketPath, handler)
 	return mux
 }
 
@@ -58,6 +67,7 @@ func (a *App) Handler() http.Handler {
 // of the successfully bound LAN/Tailscale sockets with the local Backend.
 func (a *App) Run(ctx context.Context) error {
 	defer a.roomManager.Close() // stop local room/playback workers on any exit
+	defer a.tickets.Close()
 	discovered, err := netbind.Discover(a.cfg.Server.Host, a.cfg.Server.Port)
 	if err != nil {
 		return fmt.Errorf("private interface discovery: %w", err)
@@ -102,7 +112,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	controlCtx, stopControl := context.WithCancel(ctx)
 	defer stopControl()
-	go control.Run(controlCtx, a.cfg, bound, a.logger, a.roomManager)
+	go control.RunWithAttach(controlCtx, a.cfg, bound, a.logger, a.roomManager, a.tickets, a.attachUpdates)
 
 	var serveErr error
 	select {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 	"log/slog"
 	"net/netip"
@@ -38,10 +39,18 @@ func AdvertisedEndpoints(bound []netbind.Endpoint, path string) []Endpoint {
 	return result
 }
 func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, managers ...*rooms.Manager) {
-	var roomManager *rooms.Manager
+	var manager *rooms.Manager
 	if len(managers) > 0 {
-		roomManager = managers[0]
+		manager = managers[0]
 	}
+	run(ctx, cfg, bound, log, manager, nil, nil)
+}
+
+// RunWithAttach connects direct-TV attachment state to the same control plane.
+func RunWithAttach(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, manager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) {
+	run(ctx, cfg, bound, log, manager, book, updates)
+}
+func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) {
 	endpoints := AdvertisedEndpoints(bound, cfg.Server.WebSocketPath)
 	if len(endpoints) == 0 {
 		log.Warn("No reachable private LAN/Tailscale Gateway endpoint; control registration disabled (loopback-only mode)")
@@ -49,7 +58,10 @@ func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	}
 	retry := time.Second
 	for ctx.Err() == nil {
-		err := connect(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager)
+		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates)
+		if book != nil {
+			book.Reset()
+		}
 		if roomManager != nil {
 			for _, snap := range roomManager.List() {
 				_, _ = roomManager.Fail(snap.RoomID, rooms.ReasonLost)
@@ -97,6 +109,9 @@ type response struct {
 }
 
 func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager) error {
+	return connectWithAttach(ctx, wsURL, endpoints, log, roomManager, nil, nil)
+}
+func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) error {
 	// The companion always connects to the local Backend. Never use an
 	// arbitrary LAN server for privileged media gateway registration.
 	u, err := url.Parse(wsURL)
@@ -166,7 +181,7 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 		"capabilities": map[string]any{
 			"media_protocol": 1,
 			"binary_frame":   "HCM1",
-			"direct_ws":      false,      // reserved 501 route until KAN-48
+			"direct_ws":      true,       // KAN-48: attach handshake only; no HCM1 media yet
 			"modes":          []string{}, // Direct/Adaptive not yet implemented
 		},
 	}}, "result")
@@ -176,7 +191,7 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 	if out.Action != "media.gateway.register" {
 		return errors.New("unexpected action in register result")
 	}
-	log.Info("Media Gateway registered with HomeCloud Backend", "gateway_id", deviceID, "endpoints", endpoints, "media_ready", false)
+	log.Info("Media Gateway registered with HomeCloud Backend", "gateway_id", deviceID, "endpoints", endpoints, "media_ready", true, "streaming_ready", false)
 	// KAN-47: process unsolicited room offers as soon as they arrive.
 	// A single reader owns all incoming frames; unsolicited command results
 	// for participant acknowledgements are identified by their request ID.
@@ -196,6 +211,35 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 	}
 	background, stop := context.WithCancel(ctx)
 	defer stop()
+	// Attachment updates are sent only on this trusted Gateway control socket.
+	// The existing single reader consumes and checks command acknowledgements.
+	if updates != nil {
+		go func() {
+			for {
+				select {
+				case <-background.Done():
+					return
+				case update, ok := <-updates:
+					if !ok {
+						return
+					}
+					b, e := json.Marshal(message{V: 1, ID: "gw-attach-" + strconv.FormatInt(time.Now().UnixNano(), 10), Type: "command", Action: "media.room.attach", Data: update})
+					if e != nil {
+						continue
+					}
+					writeMu.Lock()
+					timeout, cancel := context.WithTimeout(background, 5*time.Second)
+					e = conn.Write(timeout, websocket.MessageText, b)
+					cancel()
+					writeMu.Unlock()
+					if e != nil {
+						conn.CloseNow()
+						return
+					}
+				}
+			}
+		}()
+	}
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -230,7 +274,7 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 			return errors.New("invalid control event version")
 		}
 		if event.Type == "result" || event.Type == "error" {
-			if strings.HasPrefix(event.ID, "gw-room-") {
+			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") {
 				if event.Type == "error" {
 					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
 				}
@@ -252,6 +296,9 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 				continue
 			}
 			e := applyRoomOffer(roomManager, offer)
+			if e == nil && book != nil {
+				e = book.Prepare(directws.Grant{RoomID: offer.RoomID, PlaybackID: offer.PlaybackID, DeviceID: offer.Target.DeviceID, Generation: offer.Generation, Ticket: offer.AttachTicket, ExpiresAt: offer.AttachExpiresAt})
+			}
 			phase := "APPLIED"
 			if e != nil {
 				phase = "FAILED"
@@ -262,6 +309,23 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 					return e
 				}
 			}
+		case "media.room.ticket":
+			if roomManager == nil || book == nil {
+				continue
+			}
+			var renewal roomOffer
+			if e := json.Unmarshal(event.Data, &renewal); e != nil {
+				log.Warn("Invalid room ticket refresh")
+				continue
+			}
+			snap, e := roomManager.Get(renewal.RoomID)
+			if e != nil || snap.Target != renewal.Target || snap.PlaybackID != renewal.PlaybackID || snap.Generation != renewal.Generation {
+				log.Warn("Ignoring stale room ticket", "room_id", renewal.RoomID)
+				continue
+			}
+			if e = book.Prepare(directws.Grant{RoomID: renewal.RoomID, PlaybackID: renewal.PlaybackID, DeviceID: renewal.Target.DeviceID, Generation: renewal.Generation, Ticket: renewal.AttachTicket, ExpiresAt: renewal.AttachExpiresAt}); e != nil {
+				log.Warn("Rejecting room ticket refresh", "room_id", renewal.RoomID, "error", e)
+			}
 		case "media.room.closed":
 			if roomManager == nil {
 				continue
@@ -270,6 +334,9 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 				RoomID string `json:"room_id"`
 			}
 			if json.Unmarshal(event.Data, &closed) == nil && closed.RoomID != "" {
+				if book != nil {
+					book.Remove(closed.RoomID)
+				}
 				_, _ = roomManager.Stop(closed.RoomID)
 			}
 		}
@@ -277,12 +344,14 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 }
 
 type roomOffer struct {
-	RoomID     string       `json:"room_id"`
-	PlaybackID string       `json:"playback_id"`
-	Generation uint32       `json:"generation"`
-	Target     rooms.Target `json:"target"`
-	Source     rooms.Source `json:"source"`
-	GatewayID  string       `json:"gateway_id"`
+	RoomID          string       `json:"room_id"`
+	PlaybackID      string       `json:"playback_id"`
+	Generation      uint32       `json:"generation"`
+	Target          rooms.Target `json:"target"`
+	Source          rooms.Source `json:"source"`
+	GatewayID       string       `json:"gateway_id"`
+	AttachTicket    string       `json:"attach_ticket"`
+	AttachExpiresAt time.Time    `json:"attach_expires_at"`
 }
 
 func applyRoomOffer(manager *rooms.Manager, offer roomOffer) error {

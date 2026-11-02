@@ -19,7 +19,7 @@ func TestHealthAndReservedMediaEndpoint(t *testing.T) {
 		contains string
 	}{
 		{"/healthz", http.StatusOK, `"status":"alive"`},
-		{"/ws/stream", http.StatusNotImplemented, "not implemented yet"},
+
 		{"/not-found", http.StatusNotFound, "404"},
 	}
 	for _, c := range checks {
@@ -28,5 +28,10 @@ func TestHealthAndReservedMediaEndpoint(t *testing.T) {
 		if rec.Code != c.code || !strings.Contains(rec.Body.String(), c.contains) {
 			t.Fatalf("%s: got %d %q", c.path, rec.Code, rec.Body.String())
 		}
+	}
+	rec := httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ws/stream", nil))
+	if rec.Code == http.StatusOK || rec.Code == http.StatusNotImplemented {
+		t.Fatalf("media route must require WS upgrade: %d", rec.Code)
 	}
 }
