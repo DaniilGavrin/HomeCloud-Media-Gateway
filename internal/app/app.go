@@ -24,16 +24,16 @@ type App struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
-    limit := cfg.Limits.MaxRooms
-    if limit == 0 {
-        // Existing Handler-only unit tests create minimal, non-validated configs.
-        limit = 1
-    }
-    manager, err := rooms.New(limit)
-    if err != nil {
-        panic("app.New requires validated limits.max_rooms: " + err.Error())
-    }
-    return &App{cfg: cfg, logger: logger, roomManager: manager}
+	limit := cfg.Limits.MaxRooms
+	if limit == 0 {
+		// Existing Handler-only unit tests create minimal, non-validated configs.
+		limit = 1
+	}
+	manager, err := rooms.New(limit)
+	if err != nil {
+		panic("app.New requires validated limits.max_rooms: " + err.Error())
+	}
+	return &App{cfg: cfg, logger: logger, roomManager: manager}
 }
 
 // Rooms returns Gateway-local state only. HC WS Backend is authoritative.
@@ -102,7 +102,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	controlCtx, stopControl := context.WithCancel(ctx)
 	defer stopControl()
-	go control.Run(controlCtx, a.cfg, bound, a.logger)
+	go control.Run(controlCtx, a.cfg, bound, a.logger, a.roomManager)
 
 	var serveErr error
 	select {

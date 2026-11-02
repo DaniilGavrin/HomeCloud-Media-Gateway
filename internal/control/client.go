@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 	"log/slog"
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/config"
@@ -34,7 +37,11 @@ func AdvertisedEndpoints(bound []netbind.Endpoint, path string) []Endpoint {
 	}
 	return result
 }
-func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger) {
+func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, managers ...*rooms.Manager) {
+	var roomManager *rooms.Manager
+	if len(managers) > 0 {
+		roomManager = managers[0]
+	}
 	endpoints := AdvertisedEndpoints(bound, cfg.Server.WebSocketPath)
 	if len(endpoints) == 0 {
 		log.Warn("No reachable private LAN/Tailscale Gateway endpoint; control registration disabled (loopback-only mode)")
@@ -42,7 +49,12 @@ func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	}
 	retry := time.Second
 	for ctx.Err() == nil {
-		err := connect(ctx, cfg.Backend.WebSocketURL, endpoints, log)
+		err := connect(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager)
+		if roomManager != nil {
+			for _, snap := range roomManager.List() {
+				_, _ = roomManager.Fail(snap.RoomID, rooms.ReasonLost)
+			}
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -75,6 +87,7 @@ type message struct {
 	Data       any    `json:"data,omitempty"`
 }
 type response struct {
+	Topic  string          `json:"topic"`
 	V      int             `json:"v"`
 	ID     string          `json:"id"`
 	Type   string          `json:"type"`
@@ -83,7 +96,7 @@ type response struct {
 	Data   json.RawMessage `json:"data"`
 }
 
-func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger) error {
+func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager) error {
 	// The companion always connects to the local Backend. Never use an
 	// arbitrary LAN server for privileged media gateway registration.
 	u, err := url.Parse(wsURL)
@@ -164,17 +177,161 @@ func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.
 		return errors.New("unexpected action in register result")
 	}
 	log.Info("Media Gateway registered with HomeCloud Backend", "gateway_id", deviceID, "endpoints", endpoints, "media_ready", false)
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	// KAN-47: process unsolicited room offers as soon as they arrive.
+	// A single reader owns all incoming frames; unsolicited command results
+	// for participant acknowledgements are identified by their request ID.
+	var writeMu sync.Mutex
+	sendAck := func(roomID, playbackID, phase string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		b, e := json.Marshal(message{V: 1, ID: "gw-room-" + strconv.FormatInt(time.Now().UnixNano(), 10), Type: "command", Action: "media.room.participant", Data: map[string]any{
+			"room_id": roomID, "playback_id": playbackID, "participant": "gateway", "phase": phase,
+		}})
+		if e != nil {
+			return e
+		}
+		timeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return conn.Write(timeout, websocket.MessageText, b)
+	}
+	background, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-background.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(background, 5*time.Second)
+				err := conn.Ping(pingCtx)
+				cancel()
+				if err != nil {
+					conn.CloseNow()
+					return
+				}
+			}
+		}
+	}()
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			_, err = exchange(message{V: 1, ID: "gateway-heartbeat-" + strconv.FormatInt(time.Now().UnixNano(), 10), Type: "ping"}, "pong")
-			if err != nil {
-				return fmt.Errorf("control heartbeat: %w", err)
+		typ, raw, err := conn.Read(ctx)
+		if err != nil {
+			return fmt.Errorf("Gateway control read: %w", err)
+		}
+		if typ != websocket.MessageText {
+			return errors.New("binary media bytes forbidden on control WS")
+		}
+		var event response
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return fmt.Errorf("decode control event: %w", err)
+		}
+		if event.V != 1 {
+			return errors.New("invalid control event version")
+		}
+		if event.Type == "result" || event.Type == "error" {
+			if strings.HasPrefix(event.ID, "gw-room-") {
+				if event.Type == "error" {
+					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
+				}
+				continue
+			}
+			return fmt.Errorf("unsolicited control response %s", event.ID)
+		}
+		if event.Type != "event" {
+			continue
+		}
+		switch event.Topic {
+		case "media.room.offer":
+			if roomManager == nil {
+				continue
+			}
+			var offer roomOffer
+			if e := json.Unmarshal(event.Data, &offer); e != nil {
+				log.Warn("Invalid room offer", "error", e)
+				continue
+			}
+			e := applyRoomOffer(roomManager, offer)
+			phase := "APPLIED"
+			if e != nil {
+				phase = "FAILED"
+				log.Warn("Gateway room offer rejected", "room_id", offer.RoomID, "error", e)
+			}
+			if offer.RoomID != "" && offer.PlaybackID != "" {
+				if e := sendAck(offer.RoomID, offer.PlaybackID, phase); e != nil {
+					return e
+				}
+			}
+		case "media.room.closed":
+			if roomManager == nil {
+				continue
+			}
+			var closed struct {
+				RoomID string `json:"room_id"`
+			}
+			if json.Unmarshal(event.Data, &closed) == nil && closed.RoomID != "" {
+				_, _ = roomManager.Stop(closed.RoomID)
 			}
 		}
 	}
+}
+
+type roomOffer struct {
+	RoomID     string       `json:"room_id"`
+	PlaybackID string       `json:"playback_id"`
+	Generation uint32       `json:"generation"`
+	Target     rooms.Target `json:"target"`
+	Source     rooms.Source `json:"source"`
+	GatewayID  string       `json:"gateway_id"`
+}
+
+func applyRoomOffer(manager *rooms.Manager, offer roomOffer) error {
+	if offer.RoomID == "" || offer.PlaybackID == "" || offer.Generation == 0 {
+		return rooms.ErrInvalidInput
+	}
+	snap, err := manager.Get(offer.RoomID)
+	created := false
+	if errors.Is(err, rooms.ErrRoomNotFound) {
+		snap, _, err = manager.CreateAssigned(offer.RoomID, offer.Target)
+		if err != nil {
+			return err
+		}
+		created = true
+		if _, err = manager.AdvanceRoom(snap.RoomID, rooms.Connecting); err != nil {
+			_, _ = manager.Stop(snap.RoomID)
+			return err
+		}
+		if _, err = manager.AdvanceRoom(snap.RoomID, rooms.Active); err != nil {
+			_, _ = manager.Stop(snap.RoomID)
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if snap.Target != offer.Target {
+		return rooms.ErrRoomConflict
+	}
+	if snap.PlaybackID == offer.PlaybackID && snap.Generation == offer.Generation && snap.Source != nil && *snap.Source == offer.Source {
+		return nil
+	} // retransmission
+	if snap.Generation+1 != offer.Generation || snap.Generation == ^uint32(0) {
+		if created {
+			_, _ = manager.Stop(offer.RoomID)
+		}
+		return rooms.ErrStalePlayback
+	}
+	result, _, _, err := manager.StartAssignedPlayback(offer.RoomID, offer.PlaybackID, offer.Source)
+	if err != nil {
+		if created {
+			_, _ = manager.Stop(offer.RoomID)
+		}
+		return err
+	}
+	if result.Generation != offer.Generation {
+		if created {
+			_, _ = manager.Stop(offer.RoomID)
+		}
+		return rooms.ErrStalePlayback
+	}
+	return nil
 }
