@@ -129,8 +129,8 @@ func (c Config) Validate() error {
 	if c.Heartbeat.Interval.Duration < 20*time.Second || c.Heartbeat.Interval.Duration > 30*time.Second {
 		return fmt.Errorf("heartbeat.interval must be between 20s and 30s")
 	}
-	if c.Heartbeat.Grace.Duration <= 0 || c.Heartbeat.Grace.Duration > c.Heartbeat.Interval.Duration {
-		return fmt.Errorf("heartbeat.grace must be > 0 and <= heartbeat.interval")
+	if c.Heartbeat.Grace.Duration != 10*time.Second {
+		return fmt.Errorf("heartbeat.grace must equal 10s")
 	}
 	if err := validateCachePath(c.Storage.CacheDir); err != nil {
 		return fmt.Errorf("storage.cache_dir: %w", err)

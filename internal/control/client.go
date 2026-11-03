@@ -58,7 +58,7 @@ func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	}
 	retry := time.Second
 	for ctx.Err() == nil {
-		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates)
+		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg)
 		if book != nil {
 			book.Reset()
 		}
@@ -109,9 +109,9 @@ type response struct {
 }
 
 func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager) error {
-	return connectWithAttach(ctx, wsURL, endpoints, log, roomManager, nil, nil)
+	return connectWithAttach(ctx, wsURL, endpoints, log, roomManager, nil, nil, config.Config{})
 }
-func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) error {
+func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, cfg config.Config) error {
 	// The companion always connects to the local Backend. Never use an
 	// arbitrary LAN server for privileged media gateway registration.
 	u, err := url.Parse(wsURL)
@@ -176,8 +176,10 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 		return fmt.Errorf("hello: %w", err)
 	}
 	out, err := exchange(message{V: 1, ID: "gateway-register", Type: "command", Action: "media.gateway.register", Data: map[string]any{
-		"gateway_id": deviceID,
-		"endpoints":  endpoints,
+		"gateway_id":                 deviceID,
+		"endpoints":                  endpoints,
+		"heartbeat_interval_seconds": heartbeatIntervalSeconds(cfg),
+		"heartbeat_grace_seconds":    10,
 		"capabilities": map[string]any{
 			"media_protocol": 1,
 			"binary_frame":   "HCM1",
@@ -209,6 +211,21 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 		defer cancel()
 		return conn.Write(timeout, websocket.MessageText, b)
 	}
+	sendRoomHeartbeat := func(snap rooms.Snapshot) error {
+		msg, e := roomHeartbeatMessage(snap)
+		if e != nil {
+			return e
+		}
+		b, e := json.Marshal(msg)
+		if e != nil {
+			return e
+		}
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		timeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return conn.Write(timeout, websocket.MessageText, b)
+	}
 	background, stop := context.WithCancel(ctx)
 	defer stop()
 	// Attachment updates are sent only on this trusted Gateway control socket.
@@ -235,6 +252,29 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 					if e != nil {
 						conn.CloseNow()
 						return
+					}
+				}
+			}
+		}()
+	}
+	if roomManager != nil {
+		go func() {
+			ticker := time.NewTicker(time.Duration(heartbeatIntervalSeconds(cfg)) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-background.Done():
+					return
+				case <-ticker.C:
+					for _, snap := range roomManager.List() {
+						if snap.State != rooms.Active || snap.PlaybackID == "" {
+							continue
+						}
+						if e := sendRoomHeartbeat(snap); e != nil {
+							log.Warn("Gateway room heartbeat send failed", "room_id", snap.RoomID, "error", e)
+							conn.CloseNow()
+							return
+						}
 					}
 				}
 			}
@@ -274,7 +314,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			return errors.New("invalid control event version")
 		}
 		if event.Type == "result" || event.Type == "error" {
-			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") {
+			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") {
 				if event.Type == "error" {
 					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
 				}
@@ -307,6 +347,13 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			if offer.RoomID != "" && offer.PlaybackID != "" {
 				if e := sendAck(offer.RoomID, offer.PlaybackID, phase); e != nil {
 					return e
+				}
+				if e == nil {
+					if snap, getErr := roomManager.Get(offer.RoomID); getErr == nil {
+						if sendErr := sendRoomHeartbeat(snap); sendErr != nil {
+							return sendErr
+						}
+					}
 				}
 			}
 		case "media.room.ticket":
