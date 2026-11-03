@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
 	"log/slog"
 	"net/netip"
 	"net/url"
@@ -55,7 +56,17 @@ func RunWithAttach(ctx context.Context, cfg config.Config, bound []netbind.Endpo
 func RunWithControls(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, manager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl) {
 	run(ctx, cfg, bound, log, manager, book, updates, streams)
 }
-func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl) {
+
+// RunWithSources enables optional HC SS metadata checks and strategy selection.
+// No Storage Service is invented when coordinator is nil.
+func RunWithSources(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, manager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl, coordinator *source.Coordinator) {
+	run(ctx, cfg, bound, log, manager, book, updates, streams, coordinator)
+}
+func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl, extra ...*source.Coordinator) {
+	var coordinator *source.Coordinator
+	if len(extra) > 0 {
+		coordinator = extra[0]
+	}
 	endpoints := AdvertisedEndpoints(bound, cfg.Server.WebSocketPath)
 	if len(endpoints) == 0 {
 		log.Warn("No reachable private LAN/Tailscale Gateway endpoint; control registration disabled (loopback-only mode)")
@@ -63,12 +74,20 @@ func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	}
 	retry := time.Second
 	for ctx.Err() == nil {
-		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg, streams)
+		var err error
+		if coordinator != nil {
+			err = connectWithSources(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg, streams, coordinator)
+		} else {
+			err = connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg, streams)
+		}
 		if book != nil {
 			book.Reset()
 		}
 		if streams != nil {
 			streams.Reset()
+		}
+		if coordinator != nil {
+			coordinator.Reset()
 		}
 		if roomManager != nil {
 			for _, snap := range roomManager.List() {
@@ -124,6 +143,10 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 	if len(streamControls) > 0 {
 		streams = streamControls[0]
 	}
+	return connectWithSources(ctx, wsURL, endpoints, log, roomManager, book, updates, cfg, streams, nil)
+}
+
+func connectWithSources(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, cfg config.Config, streams *directws.StreamControl, coordinator *source.Coordinator) error {
 	// The companion always connects to the local Backend. Never use an
 	// arbitrary LAN server for privileged media gateway registration.
 	u, err := url.Parse(wsURL)
@@ -352,6 +375,9 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 				continue
 			}
 			e := applyRoomOffer(roomManager, offer)
+			if e == nil {
+				e = prepareRoomOfferSource(ctx, coordinator, offer)
+			}
 			if e == nil && book != nil {
 				e = book.Prepare(directws.Grant{RoomID: offer.RoomID, PlaybackID: offer.PlaybackID, DeviceID: offer.Target.DeviceID, Generation: offer.Generation, Ticket: offer.AttachTicket, ExpiresAt: offer.AttachExpiresAt, SeekPositionMS: offer.SeekPositionMS})
 			}
@@ -430,6 +456,9 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 				RoomID string `json:"room_id"`
 			}
 			if json.Unmarshal(event.Data, &closed) == nil && closed.RoomID != "" {
+				if coordinator != nil {
+					coordinator.Remove(closed.RoomID)
+				}
 				// STOP always revokes the direct media lease and releases the active
 				// sender, even if the room manager is already missing this room.
 				if book != nil {

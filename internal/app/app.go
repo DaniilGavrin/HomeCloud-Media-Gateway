@@ -16,17 +16,19 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/netbind"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
 )
 
 type App struct {
-	cfg           config.Config
-	logger        *slog.Logger
-	roomManager   *rooms.Manager
-	tickets       *directws.Book
-	attachUpdates chan directws.Update
-	streamOpener  directws.StreamOpener
-	seekOpener    directws.SeekStreamOpener
-	streamControl *directws.StreamControl
+	cfg               config.Config
+	logger            *slog.Logger
+	roomManager       *rooms.Manager
+	tickets           *directws.Book
+	attachUpdates     chan directws.Update
+	streamOpener      directws.StreamOpener
+	seekOpener        directws.SeekStreamOpener
+	streamControl     *directws.StreamControl
+	sourceCoordinator *source.Coordinator // optional until HC Storage Service is deployed
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -54,6 +56,14 @@ func (a *App) SetStreamOpener(opener directws.StreamOpener) { a.streamOpener = o
 // SetSeekStreamOpener is for future authenticated storage readers / FFmpeg.
 // It must return bytes starting at the actual achieved timeline/keyframe.
 func (a *App) SetSeekStreamOpener(opener directws.SeekStreamOpener) { a.seekOpener = opener }
+
+// SetSourceCoordinator enables KAN-56 metadata resolution for each trusted
+// Backend media.room.offer. The default remains handshake-only until HC SS
+// (KAN-39) is present; never synthesize a source or media availability.
+// Configure this before calling Run; concurrent configuration is unsupported.
+func (a *App) SetSourceCoordinator(coordinator *source.Coordinator) {
+	a.sourceCoordinator = coordinator
+}
 
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
@@ -123,7 +133,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	controlCtx, stopControl := context.WithCancel(ctx)
 	defer stopControl()
-	go control.RunWithControls(controlCtx, a.cfg, bound, a.logger, a.roomManager, a.tickets, a.attachUpdates, a.streamControl)
+	go control.RunWithSources(controlCtx, a.cfg, bound, a.logger, a.roomManager, a.tickets, a.attachUpdates, a.streamControl, a.sourceCoordinator)
 
 	var serveErr error
 	select {
