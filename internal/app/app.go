@@ -25,6 +25,7 @@ type App struct {
 	tickets       *directws.Book
 	attachUpdates chan directws.Update
 	streamOpener  directws.StreamOpener
+	streamControl *directws.StreamControl
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -37,7 +38,7 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 	if err != nil {
 		panic("app.New requires validated limits.max_rooms: " + err.Error())
 	}
-	return &App{cfg: cfg, logger: logger, roomManager: manager, tickets: directws.New(limit), attachUpdates: make(chan directws.Update, 1024)}
+	return &App{cfg: cfg, logger: logger, roomManager: manager, tickets: directws.New(limit), attachUpdates: make(chan directws.Update, 1024), streamControl: directws.NewStreamControl()}
 }
 
 // Rooms returns Gateway-local state only. HC WS Backend is authoritative.
@@ -57,7 +58,7 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive", "service": "homecloud-media-gateway"})
 	})
-	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: a.streamOpener, Report: func(u directws.Update) {
+	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: a.streamOpener, Streams: a.streamControl, Report: func(u directws.Update) {
 		select {
 		case a.attachUpdates <- u:
 		default:
@@ -117,7 +118,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	controlCtx, stopControl := context.WithCancel(ctx)
 	defer stopControl()
-	go control.RunWithAttach(controlCtx, a.cfg, bound, a.logger, a.roomManager, a.tickets, a.attachUpdates)
+	go control.RunWithControls(controlCtx, a.cfg, bound, a.logger, a.roomManager, a.tickets, a.attachUpdates, a.streamControl)
 
 	var serveErr error
 	select {

@@ -28,6 +28,7 @@ type Handler struct {
 	// integration. Never accept arbitrary file paths or source URLs from TV.
 	// A nil provider preserves the KAN-48 handshake-only behaviour.
 	OpenStream StreamOpener
+	Streams    *StreamControl
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +178,10 @@ func (h *Handler) serveStream(parent context.Context, conn *websocket.Conn, leas
 	}
 	id := mediaframe.Identity{RoomID: lease.RoomID, PlaybackID: lease.PlaybackID, Generation: lease.Generation, Epoch: lease.Epoch}
 	sender := mediaframe.NewSender(id)
+	if h.Streams != nil {
+		h.Streams.Register(lease, sender)
+		defer h.Streams.Unregister(lease)
+	}
 	done := make(chan error, 1)
 	go func() {
 		var reportSequence uint64

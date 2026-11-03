@@ -22,6 +22,7 @@ type Sender struct {
 	lastAck               pending
 	hasAck                bool
 	finished              bool
+	paused                bool
 }
 
 func NewSender(id Identity) *Sender {
@@ -65,7 +66,7 @@ func (s *Sender) waitCredit(ctx context.Context) (int, error) {
 	for {
 		s.mu.Lock()
 		outstanding := s.sent - s.acked
-		if outstanding < WindowBytes && len(s.pending) < MaxPendingFrames {
+		if !s.paused && outstanding < WindowBytes && len(s.pending) < MaxPendingFrames {
 			free := uint64(WindowBytes) - outstanding
 			if free > MaxPayloadBytes {
 				free = MaxPayloadBytes

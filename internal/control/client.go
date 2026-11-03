@@ -43,14 +43,19 @@ func Run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	if len(managers) > 0 {
 		manager = managers[0]
 	}
-	run(ctx, cfg, bound, log, manager, nil, nil)
+	run(ctx, cfg, bound, log, manager, nil, nil, nil)
 }
 
 // RunWithAttach connects direct-TV attachment state to the same control plane.
 func RunWithAttach(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, manager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) {
-	run(ctx, cfg, bound, log, manager, book, updates)
+	run(ctx, cfg, bound, log, manager, book, updates, nil)
 }
-func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update) {
+
+// RunWithControls binds trusted Backend events to current HCM1 sender controls.
+func RunWithControls(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, manager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl) {
+	run(ctx, cfg, bound, log, manager, book, updates, streams)
+}
+func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, streams *directws.StreamControl) {
 	endpoints := AdvertisedEndpoints(bound, cfg.Server.WebSocketPath)
 	if len(endpoints) == 0 {
 		log.Warn("No reachable private LAN/Tailscale Gateway endpoint; control registration disabled (loopback-only mode)")
@@ -58,7 +63,7 @@ func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 	}
 	retry := time.Second
 	for ctx.Err() == nil {
-		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg)
+		err := connectWithAttach(ctx, cfg.Backend.WebSocketURL, endpoints, log, roomManager, book, updates, cfg, streams)
 		if book != nil {
 			book.Reset()
 		}
@@ -111,7 +116,11 @@ type response struct {
 func connect(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager) error {
 	return connectWithAttach(ctx, wsURL, endpoints, log, roomManager, nil, nil, config.Config{})
 }
-func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, cfg config.Config) error {
+func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, log *slog.Logger, roomManager *rooms.Manager, book *directws.Book, updates <-chan directws.Update, cfg config.Config, streamControls ...*directws.StreamControl) error {
+	var streams *directws.StreamControl
+	if len(streamControls) > 0 {
+		streams = streamControls[0]
+	}
 	// The companion always connects to the local Backend. Never use an
 	// arbitrary LAN server for privileged media gateway registration.
 	u, err := url.Parse(wsURL)
@@ -315,7 +324,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			return errors.New("invalid control event version")
 		}
 		if event.Type == "result" || event.Type == "error" {
-			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") || strings.HasPrefix(event.ID, "gw-report-") {
+			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") || strings.HasPrefix(event.ID, "gw-report-") || strings.HasPrefix(event.ID, "gw-control-") {
 				if event.Type == "error" {
 					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
 				}
@@ -373,6 +382,42 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			}
 			if e = book.Prepare(directws.Grant{RoomID: renewal.RoomID, PlaybackID: renewal.PlaybackID, DeviceID: renewal.Target.DeviceID, Generation: renewal.Generation, Ticket: renewal.AttachTicket, ExpiresAt: renewal.AttachExpiresAt}); e != nil {
 				log.Warn("Rejecting room ticket refresh", "room_id", renewal.RoomID, "error", e)
+			}
+		case "media.room.control":
+			q, decodeErr := decodeMediaControl(event.Data)
+			if decodeErr != nil {
+				log.Warn("Invalid Gateway control command", "error", decodeErr)
+				continue
+			}
+			var applyErr error
+			if roomManager == nil || streams == nil {
+				applyErr = directws.ErrNoStream
+			} else {
+				snap, e := roomManager.Get(q.RoomID)
+				if e != nil || snap.PlaybackID != q.PlaybackID || snap.Generation != q.Generation {
+					applyErr = directws.ErrStaleControl
+				} else {
+					applyErr = streams.Apply(q)
+				}
+			}
+			phase := "APPLIED"
+			ackData := map[string]any{"room_id": q.RoomID, "playback_id": q.PlaybackID, "generation": q.Generation, "connection_epoch": q.Epoch, "command_id": q.CommandID, "command_sequence": q.CommandSequence, "participant": "gateway"}
+			if applyErr != nil {
+				phase = "FAILED"
+				ackData["error_code"] = controlErrorCode(applyErr)
+			}
+			ackData["phase"] = phase
+			b, e := json.Marshal(message{V: 1, ID: "gw-control-" + strconv.FormatInt(time.Now().UnixNano(), 10), Type: "command", Action: "media.room.control.ack", Data: ackData})
+			if e != nil {
+				return e
+			}
+			writeMu.Lock()
+			sendCtx, cancelSend := context.WithTimeout(background, 5*time.Second)
+			e = conn.Write(sendCtx, websocket.MessageText, b)
+			cancelSend()
+			writeMu.Unlock()
+			if e != nil {
+				return e
 			}
 		case "media.room.closed":
 			if roomManager == nil {
