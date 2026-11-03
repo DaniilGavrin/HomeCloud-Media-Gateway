@@ -67,6 +67,9 @@ func run(ctx context.Context, cfg config.Config, bound []netbind.Endpoint, log *
 		if book != nil {
 			book.Reset()
 		}
+		if streams != nil {
+			streams.Reset()
+		}
 		if roomManager != nil {
 			for _, snap := range roomManager.List() {
 				_, _ = roomManager.Fail(snap.RoomID, rooms.ReasonLost)
@@ -249,6 +252,9 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 					if !ok {
 						return
 					}
+					if err := observeStreamLifecycle(roomManager, update); err != nil {
+						log.Debug("Ignoring stale Gateway playback observation", "room_id", update.RoomID, "phase", update.Phase, "error", err)
+					}
 					action, requestID, data := directUpdateCommand(update)
 					b, e := json.Marshal(message{V: 1, ID: requestID, Type: "command", Action: action, Data: data})
 					if e != nil {
@@ -420,17 +426,21 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 				return e
 			}
 		case "media.room.closed":
-			if roomManager == nil {
-				continue
-			}
 			var closed struct {
 				RoomID string `json:"room_id"`
 			}
 			if json.Unmarshal(event.Data, &closed) == nil && closed.RoomID != "" {
+				// STOP always revokes the direct media lease and releases the active
+				// sender, even if the room manager is already missing this room.
 				if book != nil {
 					book.Remove(closed.RoomID)
 				}
-				_, _ = roomManager.Stop(closed.RoomID)
+				if streams != nil {
+					streams.RemoveRoom(closed.RoomID)
+				}
+				if roomManager != nil {
+					_, _ = roomManager.Stop(closed.RoomID)
+				}
 			}
 		}
 	}
