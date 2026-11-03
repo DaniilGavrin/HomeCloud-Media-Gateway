@@ -11,6 +11,11 @@ import (
 // control commands. Only the latter is allowed to influence PLAYING.
 func directUpdateCommand(u directws.Update) (action, requestID string, data any) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	if u.Phase == "SEEK_RESOLVED" {
+		return "media.room.seek.source", "gw-seek-" + suffix, map[string]any{
+			"room_id": u.RoomID, "playback_id": u.PlaybackID, "generation": u.Generation,
+			"connection_epoch": u.Epoch, "source_position_ms": u.ActualPositionMS}
+	}
 	if u.Phase == "STREAMING" || u.Phase == "ENDED" || u.Phase == "ERROR" {
 		payload := map[string]any{
 			"room_id":          u.RoomID,

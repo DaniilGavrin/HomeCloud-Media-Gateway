@@ -17,12 +17,13 @@ var (
 )
 
 type Grant struct {
-	RoomID     string    `json:"room_id"`
-	PlaybackID string    `json:"playback_id"`
-	DeviceID   string    `json:"device_id"`
-	Generation uint32    `json:"generation"`
-	Ticket     string    `json:"attach_ticket"`
-	ExpiresAt  time.Time `json:"attach_expires_at"`
+	RoomID         string    `json:"room_id"`
+	PlaybackID     string    `json:"playback_id"`
+	DeviceID       string    `json:"device_id"`
+	Generation     uint32    `json:"generation"`
+	SeekPositionMS *int64    `json:"seek_position_ms,omitempty"`
+	Ticket         string    `json:"attach_ticket"`
+	ExpiresAt      time.Time `json:"attach_expires_at"`
 }
 type Hello struct {
 	V            int            `json:"v"`
@@ -35,12 +36,13 @@ type Hello struct {
 	Capabilities map[string]any `json:"capabilities,omitempty"`
 }
 type Lease struct {
-	RoomID     string
-	PlaybackID string
-	DeviceID   string
-	Generation uint32
-	Epoch      uint64
-	Done       <-chan struct{}
+	RoomID         string
+	PlaybackID     string
+	DeviceID       string
+	Generation     uint32
+	SeekPositionMS *int64
+	Epoch          uint64
+	Done           <-chan struct{}
 }
 type slot struct {
 	grant  Grant
@@ -64,6 +66,9 @@ func New(max int) *Book {
 }
 func validGrant(g Grant, now time.Time) bool {
 	b, e := hex.DecodeString(g.Ticket)
+	if g.SeekPositionMS != nil && (*g.SeekPositionMS < 0 || *g.SeekPositionMS > 7*24*60*60*1000) {
+		return false
+	}
 	return g.RoomID != "" && g.PlaybackID != "" && g.DeviceID != "" && g.Generation > 0 && e == nil && len(b) >= 16 && len(b) <= 64 && !g.ExpiresAt.IsZero() && g.ExpiresAt.After(now) && !g.ExpiresAt.After(now.Add(61*time.Second))
 }
 
@@ -141,7 +146,12 @@ func (b *Book) Claim(h Hello) (Lease, error) {
 	s.epoch++
 	s.used = true
 	s.active = make(chan struct{})
-	return Lease{RoomID: h.RoomID, PlaybackID: h.PlaybackID, DeviceID: h.DeviceID, Generation: h.Generation, Epoch: s.epoch, Done: s.active}, nil
+	var position *int64
+	if s.grant.SeekPositionMS != nil {
+		value := *s.grant.SeekPositionMS
+		position = &value
+	}
+	return Lease{RoomID: h.RoomID, PlaybackID: h.PlaybackID, DeviceID: h.DeviceID, Generation: h.Generation, SeekPositionMS: position, Epoch: s.epoch, Done: s.active}, nil
 }
 
 // Release reports true only for the newest connection, preventing late cleanup.
@@ -195,11 +205,12 @@ func Code(err error) string {
 }
 
 type Update struct {
-	RoomID     string `json:"room_id"`
-	PlaybackID string `json:"playback_id"`
-	Generation uint32 `json:"generation"`
-	Epoch      uint64 `json:"connection_epoch"`
-	Phase      string `json:"phase"`
-	Sequence   uint64 `json:"report_sequence,omitempty"`
-	ErrorCode  string `json:"error_code,omitempty"`
+	RoomID           string `json:"room_id"`
+	PlaybackID       string `json:"playback_id"`
+	Generation       uint32 `json:"generation"`
+	Epoch            uint64 `json:"connection_epoch"`
+	Phase            string `json:"phase"`
+	ActualPositionMS int64  `json:"actual_position_ms,omitempty"`
+	Sequence         uint64 `json:"report_sequence,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
 }

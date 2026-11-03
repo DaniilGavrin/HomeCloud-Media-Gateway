@@ -306,7 +306,7 @@ func (m *Manager) Seek(t Token, positionMS int64) (Snapshot, Token, context.Cont
 	if err != nil {
 		return Snapshot{}, Token{}, nil, err
 	}
-	if r.snapshot.PlaybackState != Playing && r.snapshot.PlaybackState != Paused && r.snapshot.PlaybackState != Buffering {
+	if r.snapshot.PlaybackState != Playing && r.snapshot.PlaybackState != Paused && r.snapshot.PlaybackState != Buffering && r.snapshot.PlaybackState != Preparing && r.snapshot.PlaybackState != Ended {
 		return Snapshot{}, Token{}, nil, ErrInvalidTransition
 	}
 	if r.snapshot.Generation == math.MaxUint32 {

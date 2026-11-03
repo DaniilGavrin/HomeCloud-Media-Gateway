@@ -27,8 +27,9 @@ type Handler struct {
 	// OpenStream is an INTERNAL source provider supplied by a future storage/codec
 	// integration. Never accept arbitrary file paths or source URLs from TV.
 	// A nil provider preserves the KAN-48 handshake-only behaviour.
-	OpenStream StreamOpener
-	Streams    *StreamControl
+	OpenStream   StreamOpener
+	OpenStreamAt SeekStreamOpener
+	Streams      *StreamControl
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +133,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	conn.SetReadLimit(4096)
-	if h.OpenStream != nil && hello.Capabilities["hcm1"] == true {
+	if lease.SeekPositionMS != nil && hello.Capabilities["hcm1"] != true {
+		reject(conn, "SEEK_UNSUPPORTED")
+		return
+	}
+	if hello.Capabilities["hcm1"] == true && (h.OpenStream != nil || lease.SeekPositionMS != nil) {
 		h.serveStream(r.Context(), conn, lease)
 		return
 	}
@@ -168,13 +173,38 @@ func reject(conn *websocket.Conn, code string) {
 func (h *Handler) serveStream(parent context.Context, conn *websocket.Conn, lease Lease) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	source, err := h.OpenStream(ctx, lease)
+	var source io.ReadCloser
+	var actualPositionMS int64
+	var err error
+	if lease.SeekPositionMS != nil {
+		if h.OpenStreamAt == nil {
+			reject(conn, "SEEK_UNSUPPORTED")
+			return
+		}
+		source, actualPositionMS, err = h.OpenStreamAt(ctx, lease)
+		if err == nil && !validSeekResolution(lease, actualPositionMS) {
+			err = ErrSeekResolution
+		}
+	} else if h.OpenStream != nil {
+		source, err = h.OpenStream(ctx, lease)
+	} else {
+		reject(conn, "SOURCE_UNAVAILABLE")
+		return
+	}
 	if err != nil || source == nil {
 		if source != nil {
 			_ = source.Close()
 		}
-		reject(conn, "SOURCE_UNAVAILABLE")
+		if errors.Is(err, ErrSeekUnsupported) {
+			reject(conn, "SEEK_UNSUPPORTED")
+		} else {
+			reject(conn, "SOURCE_UNAVAILABLE")
+		}
 		return
+	}
+	if lease.SeekPositionMS != nil && h.Report != nil {
+		h.Report(Update{RoomID: lease.RoomID, PlaybackID: lease.PlaybackID, Generation: lease.Generation,
+			Epoch: lease.Epoch, Phase: "SEEK_RESOLVED", ActualPositionMS: actualPositionMS})
 	}
 	id := mediaframe.Identity{RoomID: lease.RoomID, PlaybackID: lease.PlaybackID, Generation: lease.Generation, Epoch: lease.Epoch}
 	sender := mediaframe.NewSender(id)

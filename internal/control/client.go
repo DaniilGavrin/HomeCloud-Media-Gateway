@@ -324,7 +324,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			return errors.New("invalid control event version")
 		}
 		if event.Type == "result" || event.Type == "error" {
-			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") || strings.HasPrefix(event.ID, "gw-report-") || strings.HasPrefix(event.ID, "gw-control-") {
+			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") || strings.HasPrefix(event.ID, "gw-report-") || strings.HasPrefix(event.ID, "gw-control-") || strings.HasPrefix(event.ID, "gw-seek-") {
 				if event.Type == "error" {
 					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
 				}
@@ -347,7 +347,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			}
 			e := applyRoomOffer(roomManager, offer)
 			if e == nil && book != nil {
-				e = book.Prepare(directws.Grant{RoomID: offer.RoomID, PlaybackID: offer.PlaybackID, DeviceID: offer.Target.DeviceID, Generation: offer.Generation, Ticket: offer.AttachTicket, ExpiresAt: offer.AttachExpiresAt})
+				e = book.Prepare(directws.Grant{RoomID: offer.RoomID, PlaybackID: offer.PlaybackID, DeviceID: offer.Target.DeviceID, Generation: offer.Generation, Ticket: offer.AttachTicket, ExpiresAt: offer.AttachExpiresAt, SeekPositionMS: offer.SeekPositionMS})
 			}
 			phase := "APPLIED"
 			if e != nil {
@@ -380,7 +380,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 				log.Warn("Ignoring stale room ticket", "room_id", renewal.RoomID)
 				continue
 			}
-			if e = book.Prepare(directws.Grant{RoomID: renewal.RoomID, PlaybackID: renewal.PlaybackID, DeviceID: renewal.Target.DeviceID, Generation: renewal.Generation, Ticket: renewal.AttachTicket, ExpiresAt: renewal.AttachExpiresAt}); e != nil {
+			if e = book.Prepare(directws.Grant{RoomID: renewal.RoomID, PlaybackID: renewal.PlaybackID, DeviceID: renewal.Target.DeviceID, Generation: renewal.Generation, Ticket: renewal.AttachTicket, ExpiresAt: renewal.AttachExpiresAt, SeekPositionMS: renewal.SeekPositionMS}); e != nil {
 				log.Warn("Rejecting room ticket refresh", "room_id", renewal.RoomID, "error", e)
 			}
 		case "media.room.control":
@@ -445,6 +445,7 @@ type roomOffer struct {
 	GatewayID       string       `json:"gateway_id"`
 	AttachTicket    string       `json:"attach_ticket"`
 	AttachExpiresAt time.Time    `json:"attach_expires_at"`
+	SeekPositionMS  *int64       `json:"seek_position_ms,omitempty"`
 }
 
 func applyRoomOffer(manager *rooms.Manager, offer roomOffer) error {
@@ -482,7 +483,18 @@ func applyRoomOffer(manager *rooms.Manager, offer roomOffer) error {
 		}
 		return rooms.ErrStalePlayback
 	}
-	result, _, _, err := manager.StartAssignedPlayback(offer.RoomID, offer.PlaybackID, offer.Source)
+	var result rooms.Snapshot
+	if offer.SeekPositionMS != nil {
+		if snap.PlaybackID != offer.PlaybackID || snap.Source == nil || *snap.Source != offer.Source {
+			return rooms.ErrStalePlayback
+		}
+		result, _, _, err = manager.Seek(rooms.Token{RoomID: snap.RoomID, PlaybackID: snap.PlaybackID, Generation: snap.Generation}, *offer.SeekPositionMS)
+	} else {
+		if snap.PlaybackID == offer.PlaybackID {
+			return rooms.ErrStalePlayback
+		}
+		result, _, _, err = manager.StartAssignedPlayback(offer.RoomID, offer.PlaybackID, offer.Source)
+	}
 	if err != nil {
 		if created {
 			_, _ = manager.Stop(offer.RoomID)
