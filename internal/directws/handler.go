@@ -179,11 +179,32 @@ func (h *Handler) serveStream(parent context.Context, conn *websocket.Conn, leas
 	sender := mediaframe.NewSender(id)
 	done := make(chan error, 1)
 	go func() {
+		var reportSequence uint64
+		report := func(phase, code string) {
+			if h.Report == nil || !h.Book.Valid(lease.RoomID, lease) || ctx.Err() != nil {
+				return
+			}
+			reportSequence++
+			h.Report(Update{RoomID: lease.RoomID, PlaybackID: lease.PlaybackID, Generation: lease.Generation, Epoch: lease.Epoch, Phase: phase, Sequence: reportSequence, ErrorCode: code})
+		}
+		started := false
 		err := sender.Run(ctx, source, func(writeCtx context.Context, raw []byte) error {
-			return conn.Write(writeCtx, websocket.MessageBinary, raw)
+			if err := conn.Write(writeCtx, websocket.MessageBinary, raw); err != nil {
+				return err
+			}
+			if len(raw) > mediaframe.HeaderSize && !started {
+				started = true
+				report("STREAMING", "") // first binary media frame was actually written
+			} else if len(raw) == mediaframe.HeaderSize {
+				report("ENDED", "") // EOF sent, TV still independently decides when decoding ends
+			}
+			return nil
 		})
 		done <- err
 		if err != nil {
+			if ctx.Err() == nil {
+				report("ERROR", "MEDIA_STREAM_ERROR")
+			}
 			conn.CloseNow()
 		}
 	}()

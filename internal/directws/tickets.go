@@ -200,4 +200,6 @@ type Update struct {
 	Generation uint32 `json:"generation"`
 	Epoch      uint64 `json:"connection_epoch"`
 	Phase      string `json:"phase"`
+	Sequence   uint64 `json:"report_sequence,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
 }

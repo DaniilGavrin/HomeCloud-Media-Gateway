@@ -47,7 +47,8 @@ func TestHCM1DirectWebSocketBinaryAndAck(t *testing.T) {
 	}
 	original := bytes.Repeat([]byte("abcde"), 1<<16) // ~320 KiB, multiple frames
 	var opened atomic.Int32
-	h := &Handler{Book: book, OpenStream: func(_ context.Context, lease Lease) (io.ReadCloser, error) {
+	reports := make(chan Update, 16)
+	h := &Handler{Book: book, Report: func(u Update) { reports <- u }, OpenStream: func(_ context.Context, lease Lease) (io.ReadCloser, error) {
 		if lease.RoomID != g.RoomID || lease.DeviceID != g.DeviceID || lease.Generation != g.Generation {
 			return nil, errors.New("bad lease delivered to source")
 		}
@@ -104,6 +105,22 @@ func TestHCM1DirectWebSocketBinaryAndAck(t *testing.T) {
 	}
 	if !bytes.Equal(received.Bytes(), original) || opened.Load() != 1 {
 		t.Fatal("corrupt direct WS transfer", opened.Load(), received.Len())
+	}
+	// Gateway must report actual media writes, not the earlier media.ready.
+	var observations []Update
+	until := time.After(2 * time.Second)
+	for len(observations) < 2 {
+		select {
+		case u := <-reports:
+			if u.Phase == "STREAMING" || u.Phase == "ENDED" {
+				observations = append(observations, u)
+			}
+		case <-until:
+			t.Fatalf("missing Gateway execution reports: %+v", observations)
+		}
+	}
+	if observations[0].Phase != "STREAMING" || observations[0].Sequence != 1 || observations[1].Phase != "ENDED" || observations[1].Sequence != 2 {
+		t.Fatalf("wrong stream reports %+v", observations)
 	}
 	// EOF is not a room STOP; the connection stays alive awaiting another offer.
 	book.Remove(g.RoomID)

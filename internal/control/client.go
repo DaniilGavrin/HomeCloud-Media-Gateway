@@ -240,7 +240,8 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 					if !ok {
 						return
 					}
-					b, e := json.Marshal(message{V: 1, ID: "gw-attach-" + strconv.FormatInt(time.Now().UnixNano(), 10), Type: "command", Action: "media.room.attach", Data: update})
+					action, requestID, data := directUpdateCommand(update)
+					b, e := json.Marshal(message{V: 1, ID: requestID, Type: "command", Action: action, Data: data})
 					if e != nil {
 						continue
 					}
@@ -314,7 +315,7 @@ func connectWithAttach(ctx context.Context, wsURL string, endpoints []Endpoint, 
 			return errors.New("invalid control event version")
 		}
 		if event.Type == "result" || event.Type == "error" {
-			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") {
+			if strings.HasPrefix(event.ID, "gw-room-") || strings.HasPrefix(event.ID, "gw-attach-") || strings.HasPrefix(event.ID, "gw-heartbeat-") || strings.HasPrefix(event.ID, "gw-report-") {
 				if event.Type == "error" {
 					log.Warn("Backend rejected room acknowledgement", "error", event.Error)
 				}
