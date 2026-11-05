@@ -111,8 +111,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ready["content_type"] = offer.ContentType
 		ready["media_kind"] = offer.MediaKind
 	}
+	// Register the HTTP control lease BEFORE advertising media.ready.
+	// Otherwise the TV can issue pause/resume immediately after reading ready
+	// and race this handler, getting a spurious NO_ACTIVE_STREAM.
+	if httpRangeLease && h.Streams != nil {
+		h.Streams.RegisterHTTP(lease)
+		defer h.Streams.Unregister(lease)
+	}
 	b, err := json.Marshal(ready)
 	if err != nil {
+		if h.Book.Release(lease) {
+			notify("DISCONNECTED")
+		}
 		return
 	}
 	writeCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
@@ -123,10 +133,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			notify("DISCONNECTED")
 		}
 		return
-	}
-	if httpRangeLease && h.Streams != nil {
-		h.Streams.RegisterHTTP(lease)
-		defer h.Streams.Unregister(lease)
 	}
 	notify("READY")
 	// An old connection is forcibly closed when its lease is superseded or room stops.
