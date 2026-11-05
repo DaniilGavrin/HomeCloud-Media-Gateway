@@ -85,7 +85,6 @@ func (r *remoteReader) Read(dst []byte) (int,error) {
 func (r *remoteReader) Close() error {
 	if r.closed.CompareAndSwap(false,true) {
 		r.cancel()
-		r.buffer = nil
 	}
 	return nil
 }
