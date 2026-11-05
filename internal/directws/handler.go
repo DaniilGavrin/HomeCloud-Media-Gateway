@@ -93,6 +93,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Forward attaching/ready to control independently of media availability.
 	notify("ATTACHING")
+	httpRangeLease := false
 	ready := map[string]any{
 		"v": 1, "type": "media.ready", "room_id": lease.RoomID, "playback_id": lease.PlaybackID,
 		"generation": lease.Generation, "connection_epoch": lease.Epoch,
@@ -105,12 +106,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reject(conn,"SOURCE_UNAVAILABLE")
 			return
 		}
+		httpRangeLease = true
 		ready["http_media_path"] = offer.Path
 		ready["content_type"] = offer.ContentType
 		ready["media_kind"] = offer.MediaKind
 	}
+	// Register the HTTP control lease BEFORE advertising media.ready.
+	// Otherwise the TV can issue pause/resume immediately after reading ready
+	// and race this handler, getting a spurious NO_ACTIVE_STREAM.
+	if httpRangeLease && h.Streams != nil {
+		h.Streams.RegisterHTTP(lease)
+		defer h.Streams.Unregister(lease)
+	}
 	b, err := json.Marshal(ready)
 	if err != nil {
+		if h.Book.Release(lease) {
+			notify("DISCONNECTED")
+		}
 		return
 	}
 	writeCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)

@@ -141,10 +141,10 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	// The reader's Read is bounded (HCS1 blocks <=256KiB); io.CopyN uses a
 	// small heap buffer, so gigabyte files do not load into Gateway RAM.
 	w.WriteHeader(status)
-	n,copyErr:=io.CopyN(&firstByteReporter{ResponseWriter:w, onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
-	if copyErr==nil && n>0 && end==size-1 {
-		s.emit(entry,"ENDED","")
-	}
+	// A completed HTTP response is only a completed read, not playback EOF.
+	// WebView may download the entire file into its buffer long before it
+	// finishes decoding and playing it. Only the TV decoder reports ENDED.
+	_,_ = io.CopyN(&firstByteReporter{ResponseWriter:w, onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
 }
 
 type firstByteReporter struct {
