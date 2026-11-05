@@ -5,6 +5,7 @@ on:
       - 'internal/source/**'
       - 'internal/app/**'
       - 'internal/mediahttp/**'
+      - 'internal/directws/**'
       - '.github/workflows/source-reader-pr.yml'
 permissions:
   contents: read
@@ -20,4 +21,6 @@ jobs:
           cache: true
       - run: go mod verify
       - run: go test -count=1 ./...
+      # Repeated race-detector runs cover the ready/control ordering regression.
+      - run: go test -race -count=10 ./internal/directws ./internal/mediahttp
       - run: go vet ./...
