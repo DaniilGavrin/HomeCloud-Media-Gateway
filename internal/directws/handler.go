@@ -93,6 +93,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Forward attaching/ready to control independently of media availability.
 	notify("ATTACHING")
+	httpRangeLease := false
 	ready := map[string]any{
 		"v": 1, "type": "media.ready", "room_id": lease.RoomID, "playback_id": lease.PlaybackID,
 		"generation": lease.Generation, "connection_epoch": lease.Epoch,
@@ -105,6 +106,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reject(conn,"SOURCE_UNAVAILABLE")
 			return
 		}
+		httpRangeLease = true
 		ready["http_media_path"] = offer.Path
 		ready["content_type"] = offer.ContentType
 		ready["media_kind"] = offer.MediaKind
@@ -121,6 +123,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			notify("DISCONNECTED")
 		}
 		return
+	}
+	if httpRangeLease && h.Streams != nil {
+		h.Streams.RegisterHTTP(lease)
+		defer h.Streams.Unregister(lease)
 	}
 	notify("READY")
 	// An old connection is forcibly closed when its lease is superseded or room stops.
