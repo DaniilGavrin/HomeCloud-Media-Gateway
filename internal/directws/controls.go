@@ -26,6 +26,7 @@ type controlledStream struct {
 	sender        *mediaframe.Sender
 	lastCommandID string
 	lastSequence  uint64
+	passiveHTTP   bool
 }
 
 // StreamControl attaches control-plane pause/resume to exactly one currently
@@ -46,6 +47,17 @@ func (c *StreamControl) Register(lease Lease, sender *mediaframe.Sender) {
 	c.active[lease.RoomID] = &controlledStream{lease: lease, sender: sender}
 	c.mu.Unlock()
 }
+// RegisterHTTP tracks a lease whose media data is delivered by HTTP Range.
+// HTTP media requests are demand-driven by the TV decoder; Gateway has no
+// HCM1 sender to pause, so it only fences/acknowledges control-plane intent.
+// TV's independent execution ACK and decoder observation prove actual pause.
+func (c *StreamControl) RegisterHTTP(lease Lease) {
+	if c == nil { return }
+	c.mu.Lock()
+	c.active[lease.RoomID] = &controlledStream{lease:lease, passiveHTTP:true}
+	c.mu.Unlock()
+}
+
 func (c *StreamControl) Unregister(lease Lease) {
 	if c == nil {
 		return
@@ -86,9 +98,13 @@ func (c *StreamControl) Apply(q PlaybackControl) error {
 	if q.CommandSequence <= st.lastSequence {
 		return ErrStaleControl
 	}
-	if !st.sender.SetPaused(q.Action == "pause") {
-		return ErrEndedStream
+	if !st.passiveHTTP {
+		if st.sender == nil || !st.sender.SetPaused(q.Action == "pause") {
+			return ErrEndedStream
+		}
 	}
+	// In HTTP Range mode there is no producer to pause: the native TV
+	// decoder controls network reads. Never mark PLAYING from this ACK.
 	st.lastSequence = q.CommandSequence
 	st.lastCommandID = q.CommandID
 	return nil
