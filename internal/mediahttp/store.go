@@ -142,7 +142,10 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	// small heap buffer, so gigabyte files do not load into Gateway RAM.
 	w.WriteHeader(status)
 	n,copyErr:=io.CopyN(&firstByteReporter{ResponseWriter:w, onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
-	if copyErr==nil && n>0 && end==size-1 {
+	// A suffix/ranged read ending at the final byte is NOT the decoder's
+	// playback EOF. Only a complete from-zero response may report
+	// Gateway-source ENDED; actual decoder EOF belongs to the TV.
+	if copyErr==nil && n>0 && start==0 && n==size && end==size-1 {
 		s.emit(entry,"ENDED","")
 	}
 }
