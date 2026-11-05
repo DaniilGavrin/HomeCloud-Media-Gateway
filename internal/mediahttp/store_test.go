@@ -84,9 +84,11 @@ func TestTicketScopedHTTPRangesAudioVideo(t *testing.T){
 			}
 			all:=request("GET","","127.0.0.1:9999",offer.Path)
 			if all.Code!=200||all.Body.String()!="0123456789"{t.Fatal(all.Code,all.Body.String())}
-			ended := 0
-			for _,phase := range phases { if phase == "ENDED" { ended++ } }
-			if ended != 1 { t.Fatalf("complete response should report source EOF exactly once: %v", phases) }
+			// Even a complete HTTP 200 body may be buffered before playback
+			// ends. Decoder EOF belongs to the TV, not the file delivery server.
+			for _,phase := range phases {
+				if phase == "ENDED" { t.Fatalf("HTTP download reported decoder EOF: %v", phases) }
+			}
 			head:=request("HEAD","","127.0.0.1:9999",offer.Path)
 			if head.Code!=200||head.Body.Len()!=0||head.Header().Get("Content-Length")!="10"{t.Fatal(head.Code,head.Body.String())}
 			invalid:=request("GET","bytes=0-10,99-","127.0.0.1:9999",offer.Path)
