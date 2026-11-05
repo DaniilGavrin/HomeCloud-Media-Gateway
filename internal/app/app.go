@@ -29,6 +29,7 @@ type App struct {
 	seekOpener        directws.SeekStreamOpener
 	streamControl     *directws.StreamControl
 	sourceCoordinator *source.Coordinator // optional until HC Storage Service is deployed
+	sourceReaders     map[source.Strategy]source.ReaderFactory // trusted factories only; configure before Run
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -65,6 +66,18 @@ func (a *App) SetSourceCoordinator(coordinator *source.Coordinator) {
 	a.sourceCoordinator = coordinator
 }
 
+// SetSourceReaders registers trusted local/remote readers BEFORE Run. Readers
+// only receive previously authorized, generation-fenced HC SS source plans.
+// No source connector/readers are registered in production by default.
+func (a *App) SetSourceReaders(factories map[source.Strategy]source.ReaderFactory) {
+	a.sourceReaders = make(map[source.Strategy]source.ReaderFactory, len(factories))
+	for strategy, factory := range factories {
+		if factory != nil {
+			a.sourceReaders[strategy] = factory
+		}
+	}
+}
+
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -73,7 +86,18 @@ func (a *App) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive", "service": "homecloud-media-gateway"})
 	})
-	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: a.streamOpener, OpenStreamAt: a.seekOpener, Streams: a.streamControl, Report: func(u directws.Update) {
+	opener := a.streamOpener
+	if opener == nil && a.sourceCoordinator != nil && a.sourceCoordinator.Plans != nil && len(a.sourceReaders) > 0 {
+		// HCM1 sender is already bounded by credit/ACK. The only file identifier
+		// available here is the trusted Backend-issued room/playback/generation.
+		opener = func(ctx context.Context, lease directws.Lease) (source.Reader, error) {
+			return source.OpenFromPlan(ctx, source.Token{
+				RoomID: lease.RoomID, PlaybackID: lease.PlaybackID,
+				Generation: lease.Generation,
+			}, 0, a.sourceCoordinator.Plans, a.sourceReaders)
+		}
+	}
+	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: opener, OpenStreamAt: a.seekOpener, Streams: a.streamControl, Report: func(u directws.Update) {
 		select {
 		case a.attachUpdates <- u:
 		default:
