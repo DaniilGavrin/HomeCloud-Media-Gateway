@@ -58,6 +58,8 @@ func TestTicketScopedHTTPRangesAudioVideo(t *testing.T){
 		t.Run(kind,func(t *testing.T){
 			s,book,lease:=createGrant(t,kind)
 			defer book.Close()
+			var phases []string
+			s.report = func(u directws.Update) { phases=append(phases,u.Phase) }
 			offer,err:=s.Grant(lease,"127.0.0.1:40405")
 			if err!=nil||offer.ContentType!=kind||len(offer.Path)!=len("/media/session/")+64{
 				t.Fatal(offer,err)
@@ -77,8 +79,14 @@ func TestTicketScopedHTTPRangesAudioVideo(t *testing.T){
 			}
 			suffix:=request("GET","bytes=-3","127.0.0.1:9999",offer.Path)
 			if suffix.Code!=206||suffix.Body.String()!="789"{t.Fatalf("suffix %d %s",suffix.Code,suffix.Body.String())}
+			for _,phase := range phases {
+				if phase == "ENDED" { t.Fatalf("partial/suffix bytes cannot report decoder EOF: %v", phases) }
+			}
 			all:=request("GET","","127.0.0.1:9999",offer.Path)
 			if all.Code!=200||all.Body.String()!="0123456789"{t.Fatal(all.Code,all.Body.String())}
+			ended := 0
+			for _,phase := range phases { if phase == "ENDED" { ended++ } }
+			if ended != 1 { t.Fatalf("complete response should report source EOF exactly once: %v", phases) }
 			head:=request("HEAD","","127.0.0.1:9999",offer.Path)
 			if head.Code!=200||head.Body.Len()!=0||head.Header().Get("Content-Length")!="10"{t.Fatal(head.Code,head.Body.String())}
 			invalid:=request("GET","bytes=0-10,99-","127.0.0.1:9999",offer.Path)
