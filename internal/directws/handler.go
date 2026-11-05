@@ -20,6 +20,14 @@ const HandshakeTimeout = 10 * time.Second
 // given lease and return an independently closable reader.
 type StreamOpener func(context.Context, Lease) (io.ReadCloser, error)
 
+// HTTPMediaOffer is minted from an already-claimed room ticket. Its path
+// identifies only a private, lease-bound Gateway HTTP Range session.
+type HTTPMediaOffer struct {
+	Path string
+	ContentType string
+	MediaKind string
+}
+
 type Handler struct {
 	Book   *Book
 	Log    *slog.Logger
@@ -30,10 +38,16 @@ type Handler struct {
 	OpenStream   StreamOpener
 	OpenStreamAt SeekStreamOpener
 	Streams      *StreamControl
+	// Optional direct-attach HTTP Range source used by WebView native codecs.
+	// Called only after Book.Claim consumed a Backend-issued one-use ticket.
+	OfferHTTP func(Lease,string) (HTTPMediaOffer,error)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
+	// A Tauri Android WebView has a different Origin from this private Gateway.
+	// The one-use cryptographic attach ticket, not the Origin header, proves
+	// possession of an authorized room attachment grant.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify:true})
 	if err != nil {
 		return
 	}
@@ -79,11 +93,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Forward attaching/ready to control independently of media availability.
 	notify("ATTACHING")
-	b, err := json.Marshal(map[string]any{
+	ready := map[string]any{
 		"v": 1, "type": "media.ready", "room_id": lease.RoomID, "playback_id": lease.PlaybackID,
 		"generation": lease.Generation, "connection_epoch": lease.Epoch,
 		"max_frame_payload_bytes": 65536, "window_bytes": 4194304,
-	})
+	}
+	if hello.Capabilities["http_range"] == true && h.OfferHTTP != nil {
+		offer, err := h.OfferHTTP(lease, r.RemoteAddr)
+		if err != nil {
+			h.Book.Release(lease)
+			reject(conn,"SOURCE_UNAVAILABLE")
+			return
+		}
+		ready["http_media_path"] = offer.Path
+		ready["content_type"] = offer.ContentType
+		ready["media_kind"] = offer.MediaKind
+	}
+	b, err := json.Marshal(ready)
 	if err != nil {
 		return
 	}

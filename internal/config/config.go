@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
 	"strings"
 	"time"
 
@@ -64,6 +65,10 @@ type HeartbeatConfig struct {
 }
 
 type StorageConfig struct {
+	// Explicit storage_node_id -> HCS1 private WS endpoint (never from TV/UI).
+	SourceNodes map[string]string `yaml:"source_nodes"`
+	// Shared root mappings for same-host optimization only.
+	LocalRoots map[string]string `yaml:"local_roots"`
 	CacheDir           string `yaml:"cache_dir"`
 	PrefetchLimitBytes int64  `yaml:"prefetch_limit_bytes"`
 	MaxCacheBytes      int64  `yaml:"max_cache_bytes"`
@@ -140,6 +145,21 @@ func (c Config) Validate() error {
 	}
 	if c.Storage.MaxCacheBytes < c.Storage.PrefetchLimitBytes {
 		return fmt.Errorf("storage.max_cache_bytes must be >= prefetch_limit_bytes")
+	}
+	for node, endpoint := range c.Storage.SourceNodes {
+		if node == "" || len(node) > 256 || strings.TrimSpace(node) != node ||
+			strings.ContainsAny(node, "\r\n\x00") {
+			return fmt.Errorf("invalid storage.source_nodes ID %q", node)
+		}
+		if err := source.ValidateHCS1URL(endpoint); err != nil {
+			return fmt.Errorf("storage.source_nodes[%q]: %w", node, err)
+		}
+	}
+	for name, local := range c.Storage.LocalRoots {
+		if name == "" || len(name) > 256 || strings.TrimSpace(name) != name ||
+			!filepath.IsAbs(local) || strings.ContainsAny(name, "\r\n\x00") {
+			return fmt.Errorf("storage.local_roots invalid mapping %q", name)
+		}
 	}
 	if c.Limits.MaxRooms < 1 || c.Limits.MaxRooms > 128 {
 		return fmt.Errorf("limits.max_rooms must be between 1 and 128")
