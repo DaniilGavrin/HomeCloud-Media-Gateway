@@ -19,6 +19,13 @@ heartbeat:
   grace: "10s"
 
 storage:
+  # Explicit source owner routing. Disabled by default.
+  # Example (uncomment for the actual approved HC SS node only):
+  # source_nodes:
+  #   storage-node-id: "ws://192.168.0.10:8092/ws/source"
+  source_nodes: {}
+  # Optional shared FS roots for SAME-HOST verified direct file reads:
+  local_roots: {}
   # Relative to the process working directory, not the YAML directory.
   cache_dir: "data/media-cache"
   prefetch_limit_bytes: 1073741824  # 1 GiB, disk, not RAM
