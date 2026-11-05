@@ -102,13 +102,15 @@ func validID(s string) bool {
 	return s != "" && len(s) <= 256 && s == strings.TrimSpace(s) && !strings.ContainsAny(s, "\r\n\x00")
 }
 func (r Reference) Validate() error {
-	if !validID(r.StorageNodeID) || !validID(r.FileID) {
+	if !validID(r.StorageNodeID) || len(r.FileID) > 2048 || r.FileID == "" ||
+		r.FileID != strings.TrimSpace(r.FileID) || strings.ContainsAny(r.FileID, "\r\n\x00") {
 		return ErrInvalidReference
 	}
 	return nil
 }
 func (m Metadata) Validate(ref Reference) error {
-	if !validID(m.OwnerNodeID) || !validID(m.FileID) || !validID(m.Version) ||
+	if !validID(m.OwnerNodeID) || m.FileID == "" || len(m.FileID) > 2048 ||
+		!validID(m.Version) ||
 		m.OwnerNodeID != ref.StorageNodeID || m.FileID != ref.FileID ||
 		(m.SizeBytes != nil && *m.SizeBytes < 0) ||
 		(m.Local != nil && (!validID(m.Local.SharedRootID) ||
@@ -119,7 +121,8 @@ func (m Metadata) Validate(ref Reference) error {
 	return nil
 }
 func (q RangeRequest) Validate() error {
-	if !validID(q.FileID) || !validID(q.Version) || q.Offset < 0 || q.Length < 1 ||
+	if q.FileID == "" || len(q.FileID) > 2048 || !validID(q.Version) ||
+		q.Offset < 0 || q.Length < 1 ||
 		q.Length > MaxRangeBytes || q.Offset > math.MaxInt64-q.Length {
 		return ErrInvalidReference
 	}
