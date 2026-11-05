@@ -141,13 +141,24 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	// The reader's Read is bounded (HCS1 blocks <=256KiB); io.CopyN uses a
 	// small heap buffer, so gigabyte files do not load into Gateway RAM.
 	w.WriteHeader(status)
-	n,copyErr:=io.CopyN(w,reader,end-start+1)
-	if n>0{
-		s.emit(entry,"STREAMING","")
-	}
-	if copyErr==nil && end==size-1 {
+	n,copyErr:=io.CopyN(&firstByteReporter{ResponseWriter:w, onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
+	if copyErr==nil && n>0 && end==size-1 {
 		s.emit(entry,"ENDED","")
 	}
+}
+
+type firstByteReporter struct {
+	http.ResponseWriter
+	onWrite func()
+	emitted bool
+}
+func (w *firstByteReporter) Write(p []byte)(int,error){
+	n,err:=w.ResponseWriter.Write(p)
+	if n>0&&!w.emitted {
+		w.emitted=true
+		w.onWrite()
+	}
+	return n,err
 }
 
 func (s *Store) emit(entry *session,phase,code string){
