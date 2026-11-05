@@ -4,6 +4,7 @@ on:
     paths:
       - 'internal/source/**'
       - 'internal/app/**'
+      - 'internal/mediahttp/**'
       - '.github/workflows/source-reader-pr.yml'
 permissions:
   contents: read
