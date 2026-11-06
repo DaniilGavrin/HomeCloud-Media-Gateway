@@ -100,3 +100,61 @@ func TestConcurrentClaimSingleWinner(t *testing.T) {
 		t.Fatalf("expected one ticket winner, got %d", successes)
 	}
 }
+
+func TestKAN55HTTPInPlaceRebindAndStop(t *testing.T) {
+	book := New(1)
+	defer book.Close()
+	first := grant()
+	if err := book.Prepare(first); err != nil { t.Fatal(err) }
+	handler := &Handler{Book:book, OfferHTTP:func(l Lease,_ string)(HTTPMediaOffer,error){
+		return HTTPMediaOffer{
+			Path:"/media/session/"+strings.Repeat("f",64),
+			ContentType:"video/mp4",MediaKind:"video",
+		},nil
+	}}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx,cancel := context.WithTimeout(context.Background(),5*time.Second)
+	defer cancel()
+	ws,_,err := websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),nil)
+	if err != nil {t.Fatal(err)}
+	defer ws.CloseNow()
+	hello1 := hello(first)
+	hello1.Capabilities=map[string]any{"http_range":true,"http_switch":true}
+	send := func(msg Hello){
+		t.Helper()
+		raw,e:=json.Marshal(msg)
+		if e!=nil{t.Fatal(e)}
+		if e=ws.Write(ctx,websocket.MessageText,raw);e!=nil{t.Fatal(e)}
+	}
+	recv := func(epoch uint64,playback string){
+		t.Helper()
+		kind,raw,e:=ws.Read(ctx)
+		if e!=nil||kind!=websocket.MessageText{t.Fatalf("read: %v %v",kind,e)}
+		var data struct {
+			Type string `json:"type"`
+			PlaybackID string `json:"playback_id"`
+			ConnectionEpoch uint64 `json:"connection_epoch"`
+			HTTPSwitch bool `json:"http_switch"`
+		}
+		if e=json.Unmarshal(raw,&data);e!=nil{t.Fatal(e)}
+		if data.Type!="media.ready"||data.ConnectionEpoch!=epoch||data.PlaybackID!=playback||!data.HTTPSwitch {
+			t.Fatalf("unexpected in-place ready: %+v",data)
+		}
+	}
+	send(hello1)
+	recv(1,first.PlaybackID)
+	next:=first
+	next.PlaybackID="play-next"
+	next.Generation=2
+	next.Ticket=strings.Repeat("cd",32)
+	next.ExpiresAt=time.Now().Add(30*time.Second)
+	if err=book.Prepare(next);err!=nil{t.Fatal(err)}
+	// Rebind in-place: no second websocket.Dial, same connection and room ID.
+	hello2:=hello(next)
+	hello2.Capabilities=map[string]any{"http_range":true,"http_switch":true}
+	send(hello2)
+	recv(2,next.PlaybackID)
+	book.Remove(first.RoomID)
+	if _,_,err=ws.Read(ctx);err==nil{t.Fatal("STOP kept the room control socket alive")}
+}
