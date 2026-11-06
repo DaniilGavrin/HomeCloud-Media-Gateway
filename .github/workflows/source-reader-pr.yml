@@ -30,6 +30,12 @@ jobs:
           ffprobe -version | head -n 1
       - run: go mod verify
       - run: go test -count=1 ./...
+      - name: Prove real ffprobe inspected the generated WAV fixture
+        run: go test -run '^TestKAN61FFprobeRealLoopbackRange
+      # Repeated race-detector runs cover the ready/control ordering regression.
+      - run: go test -race -count=10 ./internal/directws ./internal/mediahttp
+      - run: go vet ./...
+ -v ./internal/mediainspect
       # Repeated race-detector runs cover the ready/control ordering regression.
       - run: go test -race -count=10 ./internal/directws ./internal/mediahttp
       - run: go vet ./...
