@@ -275,8 +275,9 @@ func connectWithSources(ctx context.Context, wsURL string, endpoints []Endpoint,
 					if !ok {
 						return
 					}
-					if err := observeStreamLifecycle(roomManager, update); err != nil {
+					if err := acceptGatewayUpdate(roomManager, update); err != nil {
 						log.Debug("Ignoring stale Gateway playback observation", "room_id", update.RoomID, "phase", update.Phase, "error", err)
+						continue // Never forward stale observations to Backend.
 					}
 					action, requestID, data := directUpdateCommand(update)
 					b, e := json.Marshal(message{V: 1, ID: requestID, Type: "command", Action: action, Data: data})
