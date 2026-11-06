@@ -6,6 +6,9 @@ import (
 	"encoding/binary"
 	"io"
 	"os/exec"
+	"os"
+	"runtime"
+	"path/filepath"
 	"testing"
 	"time"
 	"sync/atomic"
@@ -105,4 +108,17 @@ func TestKAN61FFprobeRealLoopbackRange(t *testing.T){
 		len(media.Tracks)!=1||media.Tracks[0].Codec!="pcm_s16le"{
 		t.Fatalf("unexpected RIFF result: %+v",media)
 	}
+}
+
+func TestKAN61ProbeTimeoutKillsSubprocess(t *testing.T){
+	if runtime.GOOS=="windows"{t.Skip("POSIX shell fixture")}
+	token,plans,readers:=setup(t,tinyWAV(),"audio/wav")
+	executable:=filepath.Join(t.TempDir(),"slow-ffprobe")
+	if err:=os.WriteFile(executable,[]byte("#!/bin/sh\nsleep 5\n"),0700);err!=nil{t.Fatal(err)}
+	p:=New(executable,plans,readers)
+	p.Timeout=70*time.Millisecond
+	start:=time.Now()
+	_,err:=p.Probe(context.Background(),token)
+	if err==nil{t.Fatal("hung ffprobe was accepted")}
+	if time.Since(start)>2*time.Second{t.Fatalf("timeout not enforced: %v",time.Since(start))}
 }
