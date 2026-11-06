@@ -41,11 +41,19 @@ type Inspector struct {
 	Timeout time.Duration
 	LimitBytes int64
 	slots chan struct{}
+	mu sync.Mutex
+	cache map[source.Token]probeCache
+}
+type probeCache struct {
+	version string
+	media Media
+	expires time.Time
 }
 
 func New(binary string,plans *source.Plans,readers map[source.Strategy]source.ReaderFactory) *Inspector {
 	return &Inspector{Binary:binary,Plans:plans,Readers:readers,
-		Timeout:defaultProbeTimeout,LimitBytes:maxProbeBytes,slots:make(chan struct{},2)}
+		Timeout:defaultProbeTimeout,LimitBytes:maxProbeBytes,slots:make(chan struct{},2),
+		cache:make(map[source.Token]probeCache)}
 }
 
 // Probe uses a short-lived loopback-only seekable HTTP facade. ffprobe may
@@ -55,6 +63,19 @@ func (p *Inspector) Probe(parent context.Context,tok source.Token)(Media,error) 
 	if p==nil||p.Plans==nil||p.Binary==""||p.slots==nil {
 		return Media{},ErrUnavailable
 	}
+	if err:=parent.Err();err!=nil{return Media{},err}
+	plan,err:=p.Plans.Get(tok)
+	if err!=nil{return Media{},err}
+	meta:=plan.Metadata()
+	if meta.SizeBytes==nil||*meta.SizeBytes<=0 {
+		return Media{},ErrUnavailable
+	}
+	p.mu.Lock()
+	if entry,ok:=p.cache[tok];ok&&entry.version==meta.Version&&time.Now().Before(entry.expires) {
+		p.mu.Unlock()
+		return entry.media,nil
+	}
+	p.mu.Unlock()
 	select {
 	case p.slots<-struct{}{}:defer func(){<-p.slots}()
 	case <-parent.Done():return Media{},parent.Err()
@@ -64,12 +85,6 @@ func (p *Inspector) Probe(parent context.Context,tok source.Token)(Media,error) 
 	if timeout<=0||timeout>15*time.Second{timeout=defaultProbeTimeout}
 	ctx,cancel:=context.WithTimeout(parent,timeout)
 	defer cancel()
-	plan,err:=p.Plans.Get(tok)
-	if err!=nil{return Media{},err}
-	meta:=plan.Metadata()
-	if meta.SizeBytes==nil||*meta.SizeBytes<=0 {
-		return Media{},ErrUnavailable
-	}
 	if p.Readers[plan.Strategy]==nil {return Media{},source.ErrNotConfigured}
 	binary,err:=exec.LookPath(p.Binary)
 	if err!=nil {return Media{},ErrUnavailable}
@@ -114,7 +129,21 @@ func (p *Inspector) Probe(parent context.Context,tok source.Token)(Media,error) 
 		return Media{},fmt.Errorf("%w: ffprobe exit: %v",ErrUnavailable,err)
 	}
 	if output.overflow {return Media{},ErrUnavailable}
-	return Parse(output.Bytes(),meta.ContentType)
+	media,err:=Parse(output.Bytes(),meta.ContentType)
+	if err!=nil{return Media{},err}
+	// Avoid repeated ffprobe/HC SS reads for TV reconnect/ticket refresh.
+	// Cache is bounded and keyed by room/playback/generation and file version.
+	if ctx.Err()==nil {
+		p.mu.Lock()
+		if p.cache==nil{p.cache=make(map[source.Token]probeCache)}
+		if len(p.cache)>=64{
+			for k:=range p.cache {delete(p.cache,k)}
+		}
+		p.cache[tok]=probeCache{version:meta.Version,media:media,
+			expires:time.Now().Add(5*time.Minute)}
+		p.mu.Unlock()
+	}
+	return media,nil
 }
 
 type cappedOutput struct {
