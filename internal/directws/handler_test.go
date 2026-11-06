@@ -149,12 +149,18 @@ func TestKAN55HTTPInPlaceRebindAndStop(t *testing.T) {
 	next.Generation=2
 	next.Ticket=strings.Repeat("cd",32)
 	next.ExpiresAt=time.Now().Add(30*time.Second)
-	if err=book.Prepare(next);err!=nil{t.Fatal(err)}
-	// Rebind in-place: no second websocket.Dial, same connection and room ID.
+	// Simulate TV arriving first, while Gateway prepares a slow source.
 	hello2:=hello(next)
 	hello2.Capabilities=map[string]any{"http_range":true,"http_switch":true}
 	send(hello2)
+	prepared:=make(chan error,1)
+	go func(){
+		time.Sleep(120*time.Millisecond)
+		prepared <- book.Prepare(next)
+	}()
+	// Rebind in-place: no second websocket.Dial, same connection and room ID.
 	recv(2,next.PlaybackID)
+	if err=<-prepared;err!=nil{t.Fatal(err)}
 	book.Remove(first.RoomID)
 	if _,_,err=ws.Read(ctx);err==nil{t.Fatal("STOP kept the room control socket alive")}
 }
