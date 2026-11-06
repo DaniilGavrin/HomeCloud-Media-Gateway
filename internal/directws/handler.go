@@ -238,6 +238,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			finish()
 			if writeErr != nil { return }
 			notify("READY")
+			if h.Log != nil {
+				h.Log.Info("TV media WS rebind complete", "room_id",lease.RoomID,
+					"playback_id",lease.PlaybackID,"generation",lease.Generation,
+					"connection_epoch",lease.Epoch)
+			}
 		}
 	}
 	// An older TV or a Gateway without a source provider can still attach and
