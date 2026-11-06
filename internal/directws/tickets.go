@@ -43,12 +43,15 @@ type Lease struct {
 	SeekPositionMS *int64
 	Epoch          uint64
 	Done           <-chan struct{}
+	// RoomDone survives playback generation switches, but closes on STOP.
+	RoomDone       <-chan struct{}
 }
 type slot struct {
 	grant  Grant
 	used   bool
 	epoch  uint64
 	active chan struct{}
+	roomDone chan struct{}
 }
 type Book struct {
 	mu     sync.Mutex
@@ -85,7 +88,7 @@ func (b *Book) Prepare(g Grant) error {
 		if len(b.byRoom) >= b.max {
 			return ErrConflict
 		}
-		s = &slot{}
+		s = &slot{roomDone:make(chan struct{})}
 		b.byRoom[g.RoomID] = s
 	}
 	if s.grant.DeviceID != "" && s.grant.DeviceID != g.DeviceID {
@@ -151,7 +154,7 @@ func (b *Book) Claim(h Hello) (Lease, error) {
 		value := *s.grant.SeekPositionMS
 		position = &value
 	}
-	return Lease{RoomID: h.RoomID, PlaybackID: h.PlaybackID, DeviceID: h.DeviceID, Generation: h.Generation, SeekPositionMS: position, Epoch: s.epoch, Done: s.active}, nil
+	return Lease{RoomID: h.RoomID, PlaybackID: h.PlaybackID, DeviceID: h.DeviceID, Generation: h.Generation, SeekPositionMS: position, Epoch: s.epoch, Done: s.active, RoomDone:s.roomDone}, nil
 }
 
 // Release reports true only for the newest connection, preventing late cleanup.
@@ -173,6 +176,7 @@ func (b *Book) Remove(roomID string) {
 		if s.active != nil {
 			close(s.active)
 		}
+		close(s.roomDone)
 		delete(b.byRoom, roomID)
 	}
 }
@@ -183,6 +187,7 @@ func (b *Book) Reset() {
 		if s.active != nil {
 			close(s.active)
 		}
+		close(s.roomDone)
 	}
 	b.byRoom = map[string]*slot{}
 }
