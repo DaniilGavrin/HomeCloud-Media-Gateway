@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediaframe"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
 	"github.com/coder/websocket"
 )
 
@@ -41,6 +42,9 @@ type Handler struct {
 	// Optional direct-attach HTTP Range source used by WebView native codecs.
 	// Called only after Book.Claim consumed a Backend-issued one-use ticket.
 	OfferHTTP func(Lease,string) (HTTPMediaOffer,error)
+	// Advisory-only: expensive ffprobe runs asynchronously after media.ready.
+	// It never delays media delivery or authorizes an untrusted file reference.
+	Inspect func(context.Context,Lease,map[string]any) mediainspect.Report
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +143,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	notify("READY")
+	inspection:=&inspectionState{}
+	if httpRangeLease && hello.Capabilities["media_inspection"] == true {
+		h.inspectAsync(r.Context(),conn,lease,hello.Capabilities,inspection)
+	}
 	// HTTP Range with http_switch keeps the control WebSocket across playback
 	// generations. The old lease is revoked immediately (including HTTP GETs),
 	// but the room is not stopped. Legacy clients still reconnect as before.
@@ -192,6 +200,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				decodeErr = dec.Decode(new(any))
 				if errors.Is(decodeErr, io.EOF) { decodeErr = nil }
 			}
+			if kind == websocket.MessageText && decodeErr == nil &&
+				next.Type == "media.decoder.report" {
+				if !h.handleDecoderReport(r.Context(),conn,lease,next,inspection) {
+					reject(conn,"INVALID_DECODER_REPORT")
+					return
+				}
+				continue
+			}
 			if kind != websocket.MessageText || decodeErr != nil ||
 				next.Type != "media.hello" || next.V != 1 ||
 				next.RoomID != lease.RoomID || next.DeviceID != lease.DeviceID ||
@@ -238,6 +254,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			finish()
 			if writeErr != nil { return }
 			notify("READY")
+			if next.Capabilities["media_inspection"] == true {
+				h.inspectAsync(r.Context(),conn,lease,next.Capabilities,inspection)
+			}
 			if h.Log != nil {
 				h.Log.Info("TV media WS rebind complete", "room_id",lease.RoomID,
 					"playback_id",lease.PlaybackID,"generation",lease.Generation,
@@ -261,6 +280,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+// inspectAsync reports metadata separately from media.ready so a missing or
+// slow ffprobe never delays the player. A superseded playback cannot publish
+// a successful stale inspection to the TV.
+func (h *Handler) inspectAsync(parent context.Context,conn *websocket.Conn,lease Lease,caps map[string]any,state *inspectionState) {
+	if h.Inspect==nil||h.Book==nil {return}
+	go func(){
+		ctx,cancel:=context.WithTimeout(parent,9*time.Second)
+		defer cancel()
+		stopped:=make(chan struct{})
+		go func(){
+			select {
+			case <-lease.Done:cancel()
+			case <-stopped:
+			}
+		}()
+		defer close(stopped)
+		report:=h.Inspect(ctx,lease,caps)
+		if ctx.Err()!=nil||!h.Book.Valid(lease.RoomID,lease){return}
+		state.Save(lease,report)
+		h.publishInspection(ctx,conn,lease,report)
+	}()
+}
+
 // watchAttachment closes a normal/HCM1 socket on lease revocation. Opt-in
 // HTTP clients may rebind to the new generation within a bounded grace period;
 // only room STOP allows no grace (RoomDone closes immediately).

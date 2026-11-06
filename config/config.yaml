@@ -33,3 +33,9 @@ storage:
 
 limits:
   max_rooms: 4
+
+# Optional media metadata inspection. Requires ffprobe in PATH on the Gateway
+# host; disabled by default so a missing binary never breaks existing playback.
+inspector:
+  enabled: false
+  binary: "ffprobe"

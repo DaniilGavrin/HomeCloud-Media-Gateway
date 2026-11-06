@@ -5,6 +5,7 @@ on:
       - 'internal/source/**'
       - 'internal/app/**'
       - 'internal/mediahttp/**'
+      - 'internal/mediainspect/**'
       - 'internal/directws/**'
       - 'internal/control/**'
       - '.github/workflows/source-reader-pr.yml'
@@ -20,8 +21,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Ensure ffprobe exists for real WAV inspection test
+        run: |
+          if ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffprobe -version >/dev/null
+          echo "ffprobe available"
       - run: go mod verify
       - run: go test -count=1 ./...
-      # Repeated race-detector runs cover the ready/control ordering regression.
+      - name: Prove real ffprobe inspected generated WAV
+        run: go test -run TestKAN61FFprobeRealLoopbackRange -v ./internal/mediainspect
       - run: go test -race -count=10 ./internal/directws ./internal/mediahttp
       - run: go vet ./...

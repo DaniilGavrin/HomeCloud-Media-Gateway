@@ -67,3 +67,22 @@ func TestStrictConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestKAN61InspectorIsOptInAndBinaryValidated(t *testing.T) {
+	base,err:=loadText(t,validYAML)
+	if err!=nil{t.Fatal(err)}
+	if base.Inspector.Enabled{t.Fatal("legacy config unexpectedly enabled ffprobe")}
+	enabled:=validYAML+"inspector:\n  enabled: true\n  binary: ffprobe\n"
+	cfg,err:=loadText(t,enabled)
+	if err!=nil||!cfg.Inspector.Enabled||cfg.Inspector.Binary!="ffprobe"{
+		t.Fatalf("valid opt-in rejected: %+v %v",cfg.Inspector,err)
+	}
+	for _,bad:=range []string{
+		validYAML+"inspector:\n  enabled: true\n",
+		validYAML+"inspector:\n  enabled: true\n  binary: ''\n",
+	} {
+		if _,err=loadText(t,bad);err==nil{
+			t.Fatal("inspector without executable must be rejected")
+		}
+	}
+}
