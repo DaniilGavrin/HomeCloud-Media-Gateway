@@ -58,7 +58,7 @@ inside `capabilities`:
   "playback_id":"play-...", "generation":1, "device_id":"tv-...",
   "attach_ticket":"<opaque one-use ticket>",
   "capabilities": {
-    "http_range":true, "http_switch":true,
+    "http_range":true, "http_switch":true, "media_inspection":true,
     "decoder":{
       "version":1, "source":"webview_can_play_type",
       "preferred_audio_language":"rus",
@@ -93,11 +93,32 @@ send:
 }
 ```
 
+Only clients that explicitly send `capabilities.media_inspection=true`
+receive this asynchronous event. This leaves the HCM1 binary-only protocol
+untouched for legacy clients.
+
 If the WebView supports `navigator.mediaCapabilities.decodingInfo()`, TV
 tests the **inspected file's** codec/profile/level, dimensions, bitrate and
 frame rate; if it has enough information, it sends one optional
-`media.decoder.report` on the same ticket-authorized direct WS. Gateway
-returns an updated `media.inspection` decision **without rerunning ffprobe**.
+`media.decoder.report` on the same ticket-authorized direct WS:
+
+```json
+{
+  "v":1, "type":"media.decoder.report",
+  "room_id":"room-...", "playback_id":"play-...",
+  "generation":1, "device_id":"tv-...",
+  "capabilities":{"decoder":{
+    "version":1,"source":"media_capabilities_api",
+    "formats":[{"container":"mp4","video_codec":"h264","audio_codec":"aac",
+      "video_profiles":["High"],"max_level":40,"max_width":1920,
+      "max_height":1080,"certainty":"probably"}]
+  }}
+}
+```
+
+Gateway validates active lease identity and returns an updated
+`media.inspection` decision **without rerunning ffprobe**. This decision
+is a browser capability estimate, not proof of smooth physical playback.
 
 Messages and decisions are fenced by room_id/playback_id/generation and
 current direct lease epoch. An old-generation result must never appear as the
