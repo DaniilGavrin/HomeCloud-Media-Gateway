@@ -143,7 +143,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	notify("READY")
-	h.inspectAsync(r.Context(),conn,lease,hello.Capabilities)
+	inspection:=&inspectionState{}
+	h.inspectAsync(r.Context(),conn,lease,hello.Capabilities,inspection)
 	// HTTP Range with http_switch keeps the control WebSocket across playback
 	// generations. The old lease is revoked immediately (including HTTP GETs),
 	// but the room is not stopped. Legacy clients still reconnect as before.
@@ -197,6 +198,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				decodeErr = dec.Decode(new(any))
 				if errors.Is(decodeErr, io.EOF) { decodeErr = nil }
 			}
+			if kind == websocket.MessageText && decodeErr == nil &&
+				next.Type == "media.decoder.report" {
+				if !h.handleDecoderReport(r.Context(),conn,lease,next,inspection) {
+					reject(conn,"INVALID_DECODER_REPORT")
+					return
+				}
+				continue
+			}
 			if kind != websocket.MessageText || decodeErr != nil ||
 				next.Type != "media.hello" || next.V != 1 ||
 				next.RoomID != lease.RoomID || next.DeviceID != lease.DeviceID ||
@@ -243,7 +252,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			finish()
 			if writeErr != nil { return }
 			notify("READY")
-			h.inspectAsync(r.Context(),conn,lease,next.Capabilities)
+			h.inspectAsync(r.Context(),conn,lease,next.Capabilities,inspection)
 			if h.Log != nil {
 				h.Log.Info("TV media WS rebind complete", "room_id",lease.RoomID,
 					"playback_id",lease.PlaybackID,"generation",lease.Generation,
@@ -270,7 +279,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // inspectAsync reports metadata separately from media.ready so a missing or
 // slow ffprobe never delays the player. A superseded playback cannot publish
 // a successful stale inspection to the TV.
-func (h *Handler) inspectAsync(parent context.Context,conn *websocket.Conn,lease Lease,caps map[string]any) {
+func (h *Handler) inspectAsync(parent context.Context,conn *websocket.Conn,lease Lease,caps map[string]any,state *inspectionState) {
 	if h.Inspect==nil||h.Book==nil {return}
 	go func(){
 		ctx,cancel:=context.WithTimeout(parent,9*time.Second)
@@ -285,15 +294,8 @@ func (h *Handler) inspectAsync(parent context.Context,conn *websocket.Conn,lease
 		defer close(stopped)
 		report:=h.Inspect(ctx,lease,caps)
 		if ctx.Err()!=nil||!h.Book.Valid(lease.RoomID,lease){return}
-		data,err:=json.Marshal(map[string]any{
-			"v":1,"type":"media.inspection","room_id":lease.RoomID,
-			"playback_id":lease.PlaybackID,"generation":lease.Generation,
-			"connection_epoch":lease.Epoch,"report":report,
-		})
-		if err!=nil{return}
-		writeCtx,done:=context.WithTimeout(ctx,3*time.Second)
-		defer done()
-		_ =conn.Write(writeCtx,websocket.MessageText,data)
+		state.Save(lease,report)
+		h.publishInspection(ctx,conn,lease,report)
 	}()
 }
 
