@@ -3,7 +3,10 @@ package mediahttp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net/http"
+	"sync"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -118,4 +121,64 @@ func TestByteRangeSyntax(t *testing.T){
 		start,end,_,ok:=parseByteRange(tc.input,tc.size)
 		if start!=tc.start||end!=tc.end||ok!=tc.ok{t.Fatalf("%q => %d,%d,%v",tc.input,start,end,ok)}
 	}
+}
+
+type blockedReadFactory struct{ entered chan struct{} }
+func (f blockedReadFactory) Open(ctx context.Context,_ source.Decision,_ int64)(source.Reader,error){
+	return &blockedRead{ctx:ctx,entered:f.entered},nil
+}
+type blockedRead struct {
+	ctx context.Context
+	entered chan struct{}
+	once sync.Once
+}
+func (r *blockedRead) Read(_ []byte)(int,error){
+	r.once.Do(func(){close(r.entered)})
+	<-r.ctx.Done()
+	return 0,r.ctx.Err()
+}
+func (*blockedRead) Close()error{return nil}
+
+func TestKAN55SwitchCancelsInFlightHTTPRange(t *testing.T){
+	s,book,lease:=createGrant(t,"video/mp4")
+	defer book.Close()
+	entered:=make(chan struct{})
+	s.factories[source.RemotePrefetch]=blockedReadFactory{entered:entered}
+	offer,err:=s.Grant(lease,"127.0.0.1:40405")
+	if err!=nil{t.Fatal(err)}
+	req:=httptest.NewRequest("GET",offer.Path,nil)
+	req.RemoteAddr="127.0.0.1:40405"
+	resp:=httptest.NewRecorder()
+	finished:=make(chan struct{})
+	go func(){
+		defer close(finished)
+		s.ServeHTTP(resp,req)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3*time.Second):t.Fatal("range never started")
+	}
+	// New playback revokes the old lease, while preserving room_id.
+	g:=directws.Grant{RoomID:lease.RoomID,PlaybackID:"play-2",Generation:2,
+		DeviceID:lease.DeviceID,Ticket:strings.Repeat("e",64),
+		ExpiresAt:time.Now().Add(30*time.Second)}
+	if err=book.Prepare(g);err!=nil{t.Fatal(err)}
+	select {
+	case <-finished:
+	case <-time.After(3*time.Second):t.Fatal("old HTTP Range ignored playback switch")
+	}
+	if resp.Body.Len()!=0{t.Fatalf("old playback sent %d bytes after cancellation",resp.Body.Len())}
+	if !errors.Is((&firstByteReporter{ResponseWriter:httptest.NewRecorder(),revoked:lease.Done}).writeProbe(),context.Canceled){
+		t.Fatal("revoked stream was still writable")
+	}
+	newReq:=httptest.NewRequest(http.MethodGet,offer.Path,nil)
+	newReq.RemoteAddr="127.0.0.1:40405"
+	old:=httptest.NewRecorder()
+	s.ServeHTTP(old,newReq)
+	if old.Code!=http.StatusNotFound{t.Fatalf("old token accepted after switch: %d",old.Code)}
+}
+
+func (w *firstByteReporter) writeProbe() error {
+	_,err:=w.Write([]byte("stale-media"))
+	return err
 }

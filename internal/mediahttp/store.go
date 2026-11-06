@@ -4,6 +4,7 @@
 package mediahttp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -132,27 +133,57 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	if end<start{
 		w.WriteHeader(status);return
 	}
-	reader,err:=source.OpenFromPlan(r.Context(),entry.token,start,s.plans,s.factories)
+	// A TV can continue an already-started HTTP Range request even after its
+	// ticket is revoked. Tie that request to the lease, not only the initial
+	// authorization check. The canceled context interrupts remote HCS1 reads,
+	// and closing the reader releases the local file descriptor.
+	streamCtx,cancel:=context.WithCancel(r.Context())
+	defer cancel()
+	reader,err:=source.OpenFromPlan(streamCtx,entry.token,start,s.plans,s.factories)
 	if err!=nil{
 		http.Error(w,"source unavailable",http.StatusServiceUnavailable)
 		return
 	}
 	defer reader.Close()
+	closed:=make(chan struct{})
+	go func(){
+		select {
+		case <-entry.lease.Done:
+			cancel()
+			_ = reader.Close()
+		case <-closed:
+		}
+	}()
+	defer close(closed)
+	// Revocation may have happened while opening a slow remote source.
+	select {
+	case <-entry.lease.Done:
+		return
+	default:
+	}
 	// The reader's Read is bounded (HCS1 blocks <=256KiB); io.CopyN uses a
 	// small heap buffer, so gigabyte files do not load into Gateway RAM.
 	w.WriteHeader(status)
 	// A completed HTTP response is only a completed read, not playback EOF.
 	// WebView may download the entire file into its buffer long before it
 	// finishes decoding and playing it. Only the TV decoder reports ENDED.
-	_,_ = io.CopyN(&firstByteReporter{ResponseWriter:w, onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
+	// Check revocation before every write, not just before starting the GET.
+	_,_ = io.CopyN(&firstByteReporter{ResponseWriter:w, revoked:entry.lease.Done,
+		onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
 }
 
 type firstByteReporter struct {
 	http.ResponseWriter
+	revoked <-chan struct{}
 	onWrite func()
 	emitted bool
 }
 func (w *firstByteReporter) Write(p []byte)(int,error){
+	select {
+	case <-w.revoked:
+		return 0,context.Canceled
+	default:
+	}
 	n,err:=w.ResponseWriter.Write(p)
 	if n>0&&!w.emitted {
 		w.emitted=true
