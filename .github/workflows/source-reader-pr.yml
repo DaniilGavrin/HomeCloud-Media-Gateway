@@ -5,6 +5,7 @@ on:
       - 'internal/source/**'
       - 'internal/app/**'
       - 'internal/mediahttp/**'
+      - 'internal/mediainspect/**'
       - 'internal/directws/**'
       - 'internal/control/**'
       - '.github/workflows/source-reader-pr.yml'
