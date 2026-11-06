@@ -21,6 +21,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Ensure ffprobe exists for real WAV inspection test
+        run: |
+          if ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffprobe -version | head -n 1
       - run: go mod verify
       - run: go test -count=1 ./...
       # Repeated race-detector runs cover the ready/control ordering regression.
