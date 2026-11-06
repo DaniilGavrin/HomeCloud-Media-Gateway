@@ -200,7 +200,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				reject(conn,"INVALID_REQUEST")
 				return
 			}
-			renewed, claimErr := h.Book.Claim(next)
+			// Backend sends offers to Gateway and TV independently. The TV can
+			// reach this socket before Gateway has finished HC SS source lookup
+			// and installed the new ticket. Wait only for that known generation.
+			renewed, claimErr := waitRebindClaim(r.Context(), h.Book, next)
 			if claimErr != nil {
 				reject(conn,Code(claimErr))
 				return
@@ -256,6 +259,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // watchAttachment closes a normal/HCM1 socket on lease revocation. Opt-in
 // HTTP clients may rebind to the new generation within a bounded grace period;
 // only room STOP allows no grace (RoomDone closes immediately).
+// waitRebindClaim accommodates the offer-delivery race without accepting
+// any unknown ticket or increasing the room limit. Each authorized WS has one
+// bounded waiter; STOP or wrong credentials fail immediately.
+func waitRebindClaim(ctx context.Context, book *Book, next Hello) (Lease,error) {
+	waitCtx,cancel:=context.WithTimeout(ctx,7*time.Second)
+	defer cancel()
+	ticker:=time.NewTicker(50*time.Millisecond)
+	defer ticker.Stop()
+	for {
+		lease,err:=book.Claim(next)
+		if err==nil {return lease,nil}
+		if !errors.Is(err,ErrStale) {return Lease{},err}
+		select {
+		case <-waitCtx.Done():
+			return Lease{},ErrStale
+		case <-ticker.C:
+		}
+	}
+}
+
 func watchAttachment(conn *websocket.Conn, lease Lease, allowSwitch bool) chan struct{} {
 	stop := make(chan struct{})
 	go func() {
