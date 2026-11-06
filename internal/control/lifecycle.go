@@ -61,3 +61,16 @@ func observeStreamLifecycle(manager *rooms.Manager, u directws.Update) error {
 	}
 	return nil
 }
+
+// acceptGatewayUpdate fences even ATTACHING/READY/DISCONNECTED observations,
+// for which observeStreamLifecycle intentionally does not mutate local state.
+// A superseded WS lease must never publish stale data to Backend.
+func acceptGatewayUpdate(manager *rooms.Manager,u directws.Update) error {
+	if manager==nil { return nil }
+	current,err:=manager.Get(u.RoomID)
+	if err!=nil { return err }
+	if current.PlaybackID!=u.PlaybackID || current.Generation!=u.Generation {
+		return rooms.ErrStalePlayback
+	}
+	return observeStreamLifecycle(manager,u)
+}
