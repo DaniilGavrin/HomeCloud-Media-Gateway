@@ -144,7 +144,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	notify("READY")
 	inspection:=&inspectionState{}
-	h.inspectAsync(r.Context(),conn,lease,hello.Capabilities,inspection)
+	if httpRangeLease && hello.Capabilities["media_inspection"] == true {
+		h.inspectAsync(r.Context(),conn,lease,hello.Capabilities,inspection)
+	}
 	// HTTP Range with http_switch keeps the control WebSocket across playback
 	// generations. The old lease is revoked immediately (including HTTP GETs),
 	// but the room is not stopped. Legacy clients still reconnect as before.
@@ -252,7 +254,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			finish()
 			if writeErr != nil { return }
 			notify("READY")
-			h.inspectAsync(r.Context(),conn,lease,next.Capabilities,inspection)
+			if next.Capabilities["media_inspection"] == true {
+				h.inspectAsync(r.Context(),conn,lease,next.Capabilities,inspection)
+			}
 			if h.Log != nil {
 				h.Log.Info("TV media WS rebind complete", "room_id",lease.RoomID,
 					"playback_id",lease.PlaybackID,"generation",lease.Generation,
