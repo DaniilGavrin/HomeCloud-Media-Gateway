@@ -121,6 +121,8 @@ func (p *Inspector) Probe(parent context.Context,tok source.Token)(Media,error) 
 		"-v","error","-rw_timeout","5000000","-probesize","4194304",
 		"-analyzeduration","5000000","-show_format","-show_streams",
 		"-of","json","-i",url)
+	// Bound waits for inherited child pipe handles after forced cancellation.
+	command.WaitDelay=250*time.Millisecond
 	var output cappedOutput
 	command.Stdout=&output
 	command.Stderr=io.Discard // never log probe process output/paths/tokens
