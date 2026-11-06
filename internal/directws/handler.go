@@ -111,12 +111,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ready["content_type"] = offer.ContentType
 		ready["media_kind"] = offer.MediaKind
 	}
+	reuseEnabled := httpRangeLease && hello.Capabilities["http_switch"] == true
+	if reuseEnabled {
+		ready["http_switch"] = true
+	}
 	// Register the HTTP control lease BEFORE advertising media.ready.
 	// Otherwise the TV can issue pause/resume immediately after reading ready
 	// and race this handler, getting a spurious NO_ACTIVE_STREAM.
 	if httpRangeLease && h.Streams != nil {
 		h.Streams.RegisterHTTP(lease)
-		defer h.Streams.Unregister(lease)
+		defer func() { h.Streams.Unregister(lease) }()
 	}
 	b, err := json.Marshal(ready)
 	if err != nil {
@@ -135,16 +139,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	notify("READY")
-	// An old connection is forcibly closed when its lease is superseded or room stops.
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-lease.Done:
-			conn.CloseNow()
-		case <-done:
-		}
-	}()
-	defer close(done)
+	// HTTP Range with http_switch keeps the control WebSocket across playback
+	// generations. The old lease is revoked immediately (including HTTP GETs),
+	// but the room is not stopped. Legacy clients still reconnect as before.
+	watchStop := watchAttachment(conn, lease, reuseEnabled)
+	defer func() { close(watchStop) }()
 	defer func() {
 		if h.Book.Release(lease) {
 			notify("DISCONNECTED")
@@ -179,6 +178,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStream(r.Context(), conn, lease)
 		return
 	}
+	if reuseEnabled {
+		// Rebind only using a NEW Backend-issued one-use ticket on this same
+		// socket. Never accept a file URL or arbitrary source from the TV.
+		for {
+			kind, raw, readErr := conn.Read(r.Context())
+			if readErr != nil { return }
+			var next Hello
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.DisallowUnknownFields()
+			decodeErr := dec.Decode(&next)
+			if decodeErr == nil {
+				decodeErr = dec.Decode(new(any))
+				if errors.Is(decodeErr, io.EOF) { decodeErr = nil }
+			}
+			if kind != websocket.MessageText || decodeErr != nil ||
+				next.Type != "media.hello" || next.V != 1 ||
+				next.RoomID != lease.RoomID || next.DeviceID != lease.DeviceID ||
+				next.Generation <= lease.Generation ||
+				next.Capabilities["http_range"] != true || next.Capabilities["http_switch"] != true {
+				reject(conn,"INVALID_REQUEST")
+				return
+			}
+			renewed, claimErr := h.Book.Claim(next)
+			if claimErr != nil {
+				reject(conn,Code(claimErr))
+				return
+			}
+			offer, offerErr := h.OfferHTTP(renewed,r.RemoteAddr)
+			if offerErr != nil {
+				h.Book.Release(renewed)
+				reject(conn,"SOURCE_UNAVAILABLE")
+				return
+			}
+			if h.Streams != nil {
+				h.Streams.Unregister(lease)
+				h.Streams.RegisterHTTP(renewed)
+			}
+			// Release the old generation watcher before the grace timeout.
+			close(watchStop)
+			lease = renewed
+			watchStop = watchAttachment(conn,lease,true)
+			notify("ATTACHING")
+			nextReady := map[string]any{
+				"v":1,"type":"media.ready","room_id":lease.RoomID,
+				"playback_id":lease.PlaybackID,"generation":lease.Generation,
+				"connection_epoch":lease.Epoch,"http_switch":true,
+				"http_media_path":offer.Path,"content_type":offer.ContentType,
+				"media_kind":offer.MediaKind,"max_frame_payload_bytes":65536,
+				"window_bytes":4194304,
+			}
+			data, encErr := json.Marshal(nextReady)
+			if encErr != nil { return }
+			writeCtx, finish := context.WithTimeout(r.Context(),5*time.Second)
+			writeErr := conn.Write(writeCtx,websocket.MessageText,data)
+			finish()
+			if writeErr != nil { return }
+			notify("READY")
+		}
+	}
 	// An older TV or a Gateway without a source provider can still attach and
 	// remain READY. Never start sending data without explicit HCM1 capability.
 	for {
@@ -195,6 +253,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+// watchAttachment closes a normal/HCM1 socket on lease revocation. Opt-in
+// HTTP clients may rebind to the new generation within a bounded grace period;
+// only room STOP allows no grace (RoomDone closes immediately).
+func watchAttachment(conn *websocket.Conn, lease Lease, allowSwitch bool) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-lease.RoomDone:
+			conn.CloseNow()
+		case <-lease.Done:
+			if !allowSwitch {
+				conn.CloseNow()
+				return
+			}
+			timer := time.NewTimer(10*time.Second)
+			defer timer.Stop()
+			select {
+			case <-lease.RoomDone:
+				conn.CloseNow()
+			case <-timer.C:
+				conn.CloseNow()
+			case <-stop:
+			}
+		case <-stop:
+		}
+	}()
+	return stop
+}
+
 func reject(conn *websocket.Conn, code string) {
 	if conn == nil {
 		return

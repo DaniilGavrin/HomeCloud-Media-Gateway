@@ -128,3 +128,34 @@ func TestDuplicateDeliveryCannotReplayConsumedToken(t *testing.T) {
 		t.Fatalf("old ticket after refresh: %v", e)
 	}
 }
+
+func TestKAN55RoomDoneOnlyOnStop(t *testing.T){
+	book:=New(1)
+	defer book.Close()
+	first:=grant()
+	if err:=book.Prepare(first);err!=nil{t.Fatal(err)}
+	lease,err:=book.Claim(hello(first))
+	if err!=nil{t.Fatal(err)}
+	next:=first
+	next.Generation++
+	next.PlaybackID="play-next"
+	next.Ticket=strings.Repeat("cd",32)
+	next.ExpiresAt=time.Now().Add(30*time.Second)
+	if err=book.Prepare(next);err!=nil{t.Fatal(err)}
+	select{
+	case <-lease.Done:
+	default:t.Fatal("old playback lease not revoked")
+	}
+	select{
+	case <-lease.RoomDone:t.Fatal("room closed on playback switch")
+	default:
+	}
+	second,err:=book.Claim(hello(next))
+	if err!=nil{t.Fatal(err)}
+	if second.Epoch<=lease.Epoch{t.Fatal("epoch did not advance")}
+	book.Remove(first.RoomID)
+	select{
+	case <-second.RoomDone:
+	default:t.Fatal("room STOP did not close RoomDone")
+	}
+}
