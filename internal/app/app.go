@@ -15,6 +15,7 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/control"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediahttp"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/netbind"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
@@ -31,6 +32,7 @@ type App struct {
 	streamControl     *directws.StreamControl
 	sourceCoordinator *source.Coordinator // optional until HC Storage Service is deployed
 	sourceReaders     map[source.Strategy]source.ReaderFactory // trusted factories only; configure before Run
+	inspector         *mediainspect.Inspector
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -79,6 +81,12 @@ func (a *App) SetSourceReaders(factories map[source.Strategy]source.ReaderFactor
 	}
 }
 
+// SetMediaInspector is opt-in and must be called before Run. It only reads
+// source plans that were validated by HC SS and registered by Gateway.
+func (a *App) SetMediaInspector(inspector *mediainspect.Inspector) {
+	a.inspector=inspector
+}
+
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -106,6 +114,25 @@ func (a *App) Handler() http.Handler {
 		}
 	}
 	handler := &directws.Handler{Book: a.tickets, Log: a.logger, OpenStream: opener, OpenStreamAt: a.seekOpener, Streams: a.streamControl, Report: report}
+	if a.inspector!=nil {
+		handler.Inspect=func(ctx context.Context,lease directws.Lease, caps map[string]any) mediainspect.Report {
+			token:=source.Token{RoomID:lease.RoomID,PlaybackID:lease.PlaybackID,Generation:lease.Generation}
+			media,err:=a.inspector.Probe(ctx,token)
+			if err!=nil {
+				// Inspection failure does not deny a currently-working direct
+				// media URL; it simply cannot claim codec compatibility.
+				return mediainspect.Report{Status:"UNAVAILABLE",ErrorCode:"INSPECTION_UNAVAILABLE",
+					Decision:mediainspect.Decision{Mode:"UNKNOWN",Reason:"INSPECTOR_UNAVAILABLE"}}
+			}
+			tv:=mediainspect.TVCapabilities{}
+			if raw,ok:=caps["decoder"];ok {
+				if encoded,e:=json.Marshal(raw);e==nil&&len(encoded)<=8192 {
+					_ = json.Unmarshal(encoded,&tv)
+				}
+			}
+			return mediainspect.Report{Status:"READY",Media:&media,Decision:mediainspect.Decide(media,tv)}
+		}
+	}
 	if a.sourceCoordinator != nil && a.sourceCoordinator.Plans != nil && len(a.sourceReaders) > 0 {
 		httpMedia := mediahttp.New(a.tickets, a.sourceCoordinator.Plans, a.sourceReaders, report)
 		handler.OfferHTTP = func(lease directws.Lease, peerAddr string) (directws.HTTPMediaOffer,error) {
