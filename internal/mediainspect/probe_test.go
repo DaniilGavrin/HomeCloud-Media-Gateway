@@ -122,3 +122,21 @@ func TestKAN61ProbeTimeoutKillsSubprocess(t *testing.T){
 	if err==nil{t.Fatal("hung ffprobe was accepted")}
 	if time.Since(start)>2*time.Second{t.Fatalf("timeout not enforced: %v",time.Since(start))}
 }
+
+func TestKAN61ProbeCacheCannotBypassSourcePlan(t *testing.T){
+	if _,err:=exec.LookPath("ffprobe");err!=nil{t.Skip("requires ffprobe")}
+	token,plans,readers:=setup(t,tinyWAV(),"audio/wav")
+	p:=New("ffprobe",plans,readers)
+	first,err:=p.Probe(context.Background(),token)
+	if err!=nil{t.Fatal(err)}
+	// Exact same room, playback, generation and source version may use cache.
+	p.Binary="absent-ffprobe-binary-cache-test"
+	again,err:=p.Probe(context.Background(),token)
+	if err!=nil||first.DurationMS!=again.DurationMS{t.Fatalf("cache was not used: %v",err)}
+	// STOP removes the authoritative source plan; cached metadata is no
+	// authorization to continue probing that room.
+	plans.Remove(token.RoomID)
+	if _,err=p.Probe(context.Background(),token);err!=source.ErrStalePlan{
+		t.Fatalf("cache bypassed STOP: %v",err)
+	}
+}
