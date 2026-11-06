@@ -3,7 +3,6 @@
 package mediainspect
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,9 +117,8 @@ func containerName(format,hint string) string {
 func Parse(raw []byte,contentType string)(Media,error) {
 	if len(raw)==0||len(raw)>256<<10{return Media{},errors.New("INVALID_PROBE_OUTPUT_SIZE")}
 	var v rawProbe
-	d:=json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields() // ffprobe emits many unrelated standard fields: do not rely on strict schema.
-	// A fixed parser ignores extra ffprobe metadata without copying it into the TV response.
+	// Unmarshal ignores unrelated ffprobe fields: no full packets or private
+	// tags are exported to TV, and the input JSON is size capped.
 	if err:=json.Unmarshal(raw,&v);err!=nil{return Media{},fmt.Errorf("INVALID_PROBE_JSON: %w",err)}
 	if len(v.Streams)==0||len(v.Streams)>32{return Media{},errors.New("INVALID_STREAM_COUNT")}
 	out:=Media{Container:containerName(v.Format.Name,contentType),BitRate:positiveInt(v.Format.BitRate),
