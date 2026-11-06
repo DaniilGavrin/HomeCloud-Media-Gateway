@@ -46,6 +46,7 @@ type Config struct {
 	Heartbeat     HeartbeatConfig `yaml:"heartbeat"`
 	Storage       StorageConfig   `yaml:"storage"`
 	Limits        LimitsConfig    `yaml:"limits"`
+	Inspector     InspectorConfig `yaml:"inspector"`
 }
 
 type ServerConfig struct {
@@ -76,6 +77,12 @@ type StorageConfig struct {
 
 type LimitsConfig struct {
 	MaxRooms int `yaml:"max_rooms"`
+}
+
+// Missing inspector config keeps existing deployments and playback unchanged.
+type InspectorConfig struct {
+	Enabled bool `yaml:"enabled"`
+	Binary string `yaml:"binary"`
 }
 
 func Load(filename string) (Config, error) {
@@ -160,6 +167,10 @@ func (c Config) Validate() error {
 			!filepath.IsAbs(local) || strings.ContainsAny(name, "\r\n\x00") {
 			return fmt.Errorf("storage.local_roots invalid mapping %q", name)
 		}
+	}
+	if c.Inspector.Enabled && (strings.TrimSpace(c.Inspector.Binary)==""||
+		strings.ContainsAny(c.Inspector.Binary,"\r\n\x00")) {
+		return errors.New("inspector.binary must name a trusted ffprobe executable when enabled")
 	}
 	if c.Limits.MaxRooms < 1 || c.Limits.MaxRooms > 128 {
 		return fmt.Errorf("limits.max_rooms must be between 1 and 128")
