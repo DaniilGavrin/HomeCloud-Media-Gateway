@@ -44,7 +44,7 @@ func TestKAN61InspectionIsAsyncAndGenerationFenced(t *testing.T) {
 	send:=func(g Grant){
 		t.Helper()
 		hello:=hello(g)
-		hello.Capabilities=map[string]any{"http_range":true,"http_switch":true}
+		hello.Capabilities=map[string]any{"http_range":true,"http_switch":true,"media_inspection":true}
 		raw,_:=json.Marshal(hello)
 		if err:=ws.Write(ctx,websocket.MessageText,raw);err!=nil{t.Fatal(err)}
 	}
@@ -119,7 +119,7 @@ func TestKAN61ExactTVReportUpdatesDecisionWithoutReprobe(t *testing.T){
 		return m
 	}
 	helloMsg:=hello(g)
-	helloMsg.Capabilities=map[string]any{"http_range":true,"http_switch":true}
+	helloMsg.Capabilities=map[string]any{"http_range":true,"http_switch":true,"media_inspection":true}
 	send(helloMsg)
 	if x:=read();x["type"]!="media.ready"{t.Fatal(x)}
 	if x:=read();x["type"]!="media.inspection"{t.Fatal(x)}
