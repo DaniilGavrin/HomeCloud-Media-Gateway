@@ -6,6 +6,7 @@ on:
       - 'internal/app/**'
       - 'internal/mediahttp/**'
       - 'internal/directws/**'
+      - 'internal/control/**'
       - '.github/workflows/source-reader-pr.yml'
 permissions:
   contents: read
