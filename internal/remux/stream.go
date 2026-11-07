@@ -13,6 +13,8 @@ import (
  "os/exec"
  "strconv"
  "strings"
+ "sync"
+ "sync/atomic"
  "time"
 )
 
@@ -24,6 +26,8 @@ type Input struct {
 }
 
 var ErrSource = errors.New("REMUX_SOURCE_UNAVAILABLE")
+var ErrBusy = errors.New("REMUX_BUSY")
+var ErrPermit = errors.New("REMUX_INVALID_PERMIT")
 
 // Runner limits simultaneous FFmpeg conversions, to protect low-power homes.
 type Runner struct {
@@ -39,17 +43,58 @@ func New(binary string, concurrent int) (*Runner,error) {
  return &Runner{Binary:path,slots:make(chan struct{},concurrent)},nil
 }
 
-// Run streams fragmented MP4 directly to output. It does not allocate a
-// complete media file and does not encode video. FFmpeg input is a private,
-// short-lived, seekable loopback Range endpoint; it is NOT a client file URL.
-// Reader, local HTTP listener and child process all die with ctx/STOP.
+// Permit reserves a single FFmpeg process slot before the HTTP response is
+// committed. It cannot be used twice and Release is idempotent.
+type Permit struct {
+ runner *Runner
+ released atomic.Bool
+ started atomic.Bool
+ once sync.Once
+}
+
+// TryReserve fails immediately when all conversions are active. There is no
+// potentially unbounded queue of HTTP sessions on low-memory installations.
+func (r *Runner) TryReserve() (*Permit,error) {
+ if r==nil||r.slots==nil {return nil,ErrSource}
+ select {
+ case r.slots<-struct{}{}:return &Permit{runner:r},nil
+ default:return nil,ErrBusy
+ }
+}
+
+func (p *Permit) Release() {
+ if p==nil||p.runner==nil{return}
+ p.once.Do(func(){
+  p.released.Store(true)
+  <-p.runner.slots
+ })
+}
+
+// Run on a reserved permit consumes it and always releases the slot,
+// including on FFmpeg errors, STOP, or a canceled HTTP request.
+func (p *Permit) Run(ctx context.Context,src Input,profile Profile,out io.Writer) error {
+ if p==nil||p.runner==nil||p.released.Load()||!p.started.CompareAndSwap(false,true) {
+  return ErrPermit
+ }
+ defer p.Release()
+ return p.runner.execute(ctx,src,profile,out)
+}
+
+// Run is used by standalone callers and tests. The Gateway HTTP service
+// reserves capacity separately to return a true HTTP 503 before streaming.
 func (r *Runner) Run(ctx context.Context,src Input,p Profile,out io.Writer) error {
+ if err:=ctx.Err();err!=nil{return err}
+ permit,err:=r.TryReserve()
+ if err!=nil{return err}
+ return permit.Run(ctx,src,p,out)
+}
+
+// execute streams fragmented MP4 without a whole-file copy. FFmpeg gets only
+// a private loopback Range facade, never a TV-provided file path or URL.
+func (r *Runner) execute(ctx context.Context,src Input,p Profile,out io.Writer) error {
  if r==nil||out==nil||src.Open==nil||src.Size<=0 {return ErrSource}
  if err:=p.Validate();err!=nil{return err}
- select {
- case r.slots<-struct{}{}:defer func(){<-r.slots}()
- case <-ctx.Done():return ctx.Err()
- }
+ if err:=ctx.Err();err!=nil{return err}
  ln,err:=net.Listen("tcp","127.0.0.1:0")
  if err!=nil{return err}
  var nonce [16]byte
