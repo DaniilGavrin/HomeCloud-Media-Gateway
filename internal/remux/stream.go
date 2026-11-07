@@ -89,7 +89,7 @@ func (r *Runner) Run(ctx context.Context,src Input,p Profile,out io.Writer) erro
  if p.VideoIndex>=0 {args=append(args,"-map",fmt.Sprintf("0:%d",p.VideoIndex),"-c:v","copy")}
  args=append(args,"-map",fmt.Sprintf("0:%d",p.AudioIndex))
  if p.CopyAudio {args=append(args,"-c:a","copy")} else {
-  args=append(args,"-c:a","aac","-b:a","160k","-ac","2","-threads","1")
+  args=append(args,"-c:a","aac","-b:a","160k","-ac","2","-ar","48000","-threads","1")
  }
  args=append(args,"-sn","-dn","-map_metadata","-1",
   "-movflags","+empty_moov+frag_keyframe+default_base_moof",

@@ -71,7 +71,11 @@ func Select(media mediainspect.Media, caps mediainspect.TVCapabilities, audioInd
  } else {
   p.MediaKind="audio"
  }
- p.CopyAudio=audio.Codec=="aac"
+ // Raw AAC copy is safe only when the declared output matches the
+ // TV's independently measured AAC 48kHz/stereo candidate. For other AAC
+ // parameters, normalize audio just as with other codecs.
+ p.CopyAudio=audio.Codec=="aac" && audio.SampleRate==48000 &&
+  audio.Channels==2 && audio.BitRate>0 && audio.BitRate<=192000
  if err:=p.Validate();err!=nil{return Profile{},ErrUnsupported}
  for _,f:=range caps.Formats {
   if f.Container!="mp4" || f.AudioCodec!="aac" || f.Certainty!="probably" {continue}

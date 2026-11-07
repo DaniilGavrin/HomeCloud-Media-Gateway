@@ -19,7 +19,7 @@ func TestSelectKeepsVideoAndSelectsAudio(t *testing.T) {
  media:=mediainspect.Media{Container:"matroska",Tracks:[]mediainspect.Track{
   {Index:0,Kind:"video",Codec:"h264",Profile:"High",Level:40,Width:1920,Height:1080},
   {Index:1,Kind:"audio",Codec:"dts",Default:true},
-  {Index:2,Kind:"audio",Codec:"aac",Language:"rus"},
+  {Index:2,Kind:"audio",Codec:"aac",Language:"rus",SampleRate:48000,Channels:2,BitRate:128000},
  }}
  caps:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{
   {Container:"mp4",VideoCodec:"h264",AudioCodec:"aac",VideoProfiles:[]string{"High"},
@@ -146,5 +146,31 @@ func TestRealFFmpegCopiesH264VideoAndSelectsSecondAudioTrack(t *testing.T){
   payload.Streams[0].CodecType!="video" || payload.Streams[1].CodecName!="aac" ||
   payload.Streams[1].CodecType!="audio"{
   t.Fatalf("expected exactly copied h264 + selected AAC track, got %+v",payload.Streams)
+ }
+}
+
+
+// The converted AAC format must exactly match the output codec declaration
+// passed to WebView MediaCapabilities: 160k/48kHz/stereo when re-encoding.
+func TestCopyAACOnlyWhenOutputParametersAreCompatible(t *testing.T){
+ caps:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{{
+  Container:"mp4",AudioCodec:"aac",Certainty:"probably",
+ }}}
+ for _,tc:=range []struct{name string; rate,channels int;bitRate int64;copy bool}{
+  {"matching",48000,2,128000,true},
+  {"surround",48000,6,256000,false},
+  {"other-sample-rate",44100,2,128000,false},
+  {"unknown-bit-rate",48000,2,0,false},
+  {"large-bitrate",48000,2,256000,false},
+ } {
+  t.Run(tc.name,func(t *testing.T){
+   media:=mediainspect.Media{Container:"matroska",Tracks:[]mediainspect.Track{{
+    Index:0,Kind:"audio",Codec:"aac",SampleRate:tc.rate,
+    Channels:tc.channels,BitRate:tc.bitRate,
+   }}}
+   profile,err:=Select(media,caps,0)
+   if err!=nil{t.Fatal(err)}
+   if profile.CopyAudio!=tc.copy{t.Fatalf("unexpected copy for %s: %v",tc.name,profile.CopyAudio)}
+  })
  }
 }
