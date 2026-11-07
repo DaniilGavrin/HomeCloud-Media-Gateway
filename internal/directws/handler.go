@@ -118,6 +118,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ready["content_type"] = offer.ContentType
 		ready["media_kind"] = offer.MediaKind
 	}
+	if h.OfferConversion!=nil&&hello.Capabilities["audio_selection"]==true {
+		ready["audio_selection"]=true
+	}
 	reuseEnabled := httpRangeLease && hello.Capabilities["http_switch"] == true
 	if reuseEnabled {
 		ready["http_switch"] = true
@@ -255,6 +258,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"http_media_path":offer.Path,"content_type":offer.ContentType,
 				"media_kind":offer.MediaKind,"max_frame_payload_bytes":65536,
 				"window_bytes":4194304,
+			}
+			if h.OfferConversion!=nil&&next.Capabilities["audio_selection"]==true {
+				nextReady["audio_selection"]=true
 			}
 			data, encErr := json.Marshal(nextReady)
 			if encErr != nil { return }
