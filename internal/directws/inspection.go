@@ -85,8 +85,14 @@ func (h *Handler) handleAudioSelect(ctx context.Context,conn *websocket.Conn,l L
 		msg.Generation!=l.Generation||msg.DeviceID!=l.DeviceID||
 		msg.AudioIndex==nil||*msg.AudioIndex<0||*msg.AudioIndex>255||
 		h.OfferConversion==nil{return false}
-	media,caps,ok:=state.Selected(l,*msg.AudioIndex)
+	media,_,ok:=state.Selected(l,*msg.AudioIndex)
 	if !ok{return false}
+	// Convert the OUTPUT codec combination, not the original source.
+	// The output capability is independently measured by TV MediaCapabilities.
+	rawCaps,marshalErr:=json.Marshal(msg.Capabilities["decoder"])
+	if marshalErr!=nil||len(rawCaps)>8192{return false}
+	var caps mediainspect.TVCapabilities
+	if json.Unmarshal(rawCaps,&caps)!=nil||caps.Source!="media_capabilities_api" {return false}
 	offer,err:=h.OfferConversion(l,peer,media,caps,*msg.AudioIndex)
 	if err!=nil{return false}
 	raw,_:=json.Marshal(map[string]any{
