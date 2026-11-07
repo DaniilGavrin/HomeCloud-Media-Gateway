@@ -89,7 +89,10 @@ func (s *Store) GrantConversion(l directws.Lease,peer string,media mediainspect.
  s.byToken[secret]=entry
  s.mu.Unlock()
  go func(){
-  <-l.Done
+  select {
+  case <-l.Done:
+  case <-entry.convertRevoked:
+  }
   s.mu.Lock()
   if s.byToken[secret]==entry{delete(s.byToken,secret)}
   s.mu.Unlock()
