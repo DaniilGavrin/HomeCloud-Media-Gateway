@@ -120,10 +120,12 @@ func TestRealFFmpegCopiesH264VideoAndSelectsSecondAudioTrack(t *testing.T){
   "-f","lavfi","-i","sine=frequency=880:duration=0.8",
   "-map","0:v","-map","1:a","-map","2:a",
   "-c:v","libx264","-pix_fmt","yuv420p","-preset","ultrafast",
-  "-c:a","aac","-shortest","-f","matroska",input)
+  "-c:a:0","aac","-c:a:1","ac3","-shortest","-f","matroska",input)
  if output,err:=create.CombinedOutput();err!=nil{t.Fatalf("create fixture: %v: %s",err,output)}
  raw,err:=os.ReadFile(input);if err!=nil{t.Fatal(err)}
- profile:=Profile{SourceFormat:"matroska",VideoIndex:0,AudioIndex:2,CopyAudio:true,MediaKind:"video"}
+ // Audio index 2 is deliberately AC3: video stays H.264 (stream copy),
+ // while the selected incompatible soundtrack must become AAC.
+ profile:=Profile{SourceFormat:"matroska",VideoIndex:0,AudioIndex:2,CopyAudio:false,MediaKind:"video"}
  runner,err:=New(ffmpeg,1);if err!=nil{t.Fatal(err)}
  ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second)
  defer cancel()
