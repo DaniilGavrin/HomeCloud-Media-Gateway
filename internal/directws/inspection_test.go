@@ -178,7 +178,7 @@ func TestKAN63SelectionIsTrackScopedAndGenerationFenced(t *testing.T){
   var m map[string]any;if e=json.Unmarshal(raw,&m);e!=nil{t.Fatal(e)}
   return m
  }
- caps:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{{
+ caps:=mediainspect.TVCapabilities{Version:1,Source:"media_capabilities_api",Formats:[]mediainspect.FormatSupport{{
   Container:"mp4",VideoCodec:"h264",AudioCodec:"aac",Certainty:"probably",
   VideoProfiles:[]string{"High"},MaxLevel:40,MaxWidth:1920,MaxHeight:1080,
  }}}
@@ -195,7 +195,8 @@ func TestKAN63SelectionIsTrackScopedAndGenerationFenced(t *testing.T){
  if calls.Load()!=0{t.Fatal("unverified index invoked converter")}
  selected:=1
  send(Hello{V:1,Type:"media.audio.select",RoomID:g.RoomID,PlaybackID:g.PlaybackID,
-  Generation:g.Generation,DeviceID:g.DeviceID,AudioIndex:&selected})
+  Generation:g.Generation,DeviceID:g.DeviceID,AudioIndex:&selected,
+  Capabilities:map[string]any{"decoder":caps}})
  m:=recv()
  if m["type"]!="media.convert.ready"||m["audio_index"]!=float64(1)||m["seek_supported"]!=false{
   t.Fatalf("bad conversion offer: %v",m)
