@@ -34,6 +34,7 @@ type Hello struct {
 	Generation   uint32         `json:"generation"`
 	AttachTicket string         `json:"attach_ticket"`
 	Capabilities map[string]any `json:"capabilities,omitempty"`
+	AudioIndex *int `json:"audio_index,omitempty"`
 }
 type Lease struct {
 	RoomID         string

@@ -16,6 +16,7 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediahttp"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/remux"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/netbind"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/rooms"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
@@ -33,6 +34,7 @@ type App struct {
 	sourceCoordinator *source.Coordinator // optional until HC Storage Service is deployed
 	sourceReaders     map[source.Strategy]source.ReaderFactory // trusted factories only; configure before Run
 	inspector         *mediainspect.Inspector
+	converter         *remux.Runner
 }
 
 func New(cfg config.Config, logger *slog.Logger) *App {
@@ -88,6 +90,9 @@ func (a *App) SetMediaInspector(inspector *mediainspect.Inspector) {
 }
 
 // Handler can be tested without real TCP sockets; KAN-48 implements /ws/stream.
+// KAN-63 conversion is opt-in by the TV and only with real ffprobe metadata.
+func (a *App) SetConverter(r *remux.Runner){a.converter=r}
+
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -135,6 +140,17 @@ func (a *App) Handler() http.Handler {
 	}
 	if a.sourceCoordinator != nil && a.sourceCoordinator.Plans != nil && len(a.sourceReaders) > 0 {
 		httpMedia := mediahttp.New(a.tickets, a.sourceCoordinator.Plans, a.sourceReaders, report)
+		if a.converter!=nil && a.inspector!=nil {
+			httpMedia.SetConverter(a.converter)
+			handler.OfferConversion=func(l directws.Lease,peer string,media mediainspect.Media,
+				caps mediainspect.TVCapabilities,audio int)(directws.HTTPMediaOffer,error) {
+				offer,err:=httpMedia.GrantConversion(l,peer,media,caps,audio)
+				if err!=nil{return directws.HTTPMediaOffer{},err}
+				return directws.HTTPMediaOffer{Path:offer.Path,ContentType:offer.ContentType,MediaKind:offer.MediaKind},nil
+			}
+			mux.Handle("GET /media/convert/",httpMedia)
+			mux.Handle("HEAD /media/convert/",httpMedia)
+		}
 		handler.OfferHTTP = func(lease directws.Lease, peerAddr string) (directws.HTTPMediaOffer,error) {
 			offer,err:=httpMedia.Grant(lease,peerAddr)
 			if err!=nil{return directws.HTTPMediaOffer{},err}

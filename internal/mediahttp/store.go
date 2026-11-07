@@ -19,6 +19,8 @@ import (
 
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/remux"
 )
 
 type Offer struct {
@@ -38,6 +40,9 @@ type session struct {
 	streamed bool
 	ended bool
 	reportSeq uint64
+ conversion *remux.Profile
+ convertRevoked chan struct{}
+ convertActive bool
 }
 
 type Store struct {
@@ -47,10 +52,53 @@ type Store struct {
 	plans *source.Plans
 	factories map[source.Strategy]source.ReaderFactory
 	report Report
+ converter *remux.Runner
 }
 
 func New(book *directws.Book, plans *source.Plans, factories map[source.Strategy]source.ReaderFactory, report Report) *Store {
 	return &Store{book:book,plans:plans,factories:factories,byToken:make(map[string]*session),report:report}
+}
+
+func (s *Store) SetConverter(r *remux.Runner){s.converter=r}
+
+// GrantConversion can be called only on a valid TV direct-WS lease. The
+// selected track is checked against ffprobe and declared OUTPUT capabilities.
+func (s *Store) GrantConversion(l directws.Lease,peer string,media mediainspect.Media,
+ caps mediainspect.TVCapabilities,selectedAudio int)(Offer,error) {
+ if s==nil||s.converter==nil||s.plans==nil||s.book==nil||!s.book.Valid(l.RoomID,l){return Offer{},remux.ErrUnsupported}
+ ip,err:=peerIP(peer);if err!=nil{return Offer{},err}
+ profile,err:=remux.Select(media,caps,selectedAudio);if err!=nil{return Offer{},err}
+ token:=source.Token{RoomID:l.RoomID,PlaybackID:l.PlaybackID,Generation:l.Generation}
+ plan,err:=s.plans.Get(token);if err!=nil{return Offer{},err}
+ if s.factories[plan.Strategy]==nil{return Offer{},source.ErrNotConfigured}
+ meta:=plan.Metadata();if meta.SizeBytes==nil||*meta.SizeBytes<=0{return Offer{},source.ErrInvalidMetadata}
+ var entropy [32]byte
+ if _,err=rand.Read(entropy[:]);err!=nil{return Offer{},err}
+ secret:=hex.EncodeToString(entropy[:])
+ entry:=&session{lease:l,peer:ip,token:token,meta:meta,expires:time.Now().Add(24*time.Hour),
+  conversion:&profile,convertRevoked:make(chan struct{})}
+ s.mu.Lock()
+ if !s.book.Valid(l.RoomID,l){s.mu.Unlock();return Offer{},remux.ErrUnsupported}
+ for existing,old:=range s.byToken {
+  if old.conversion!=nil&&old.lease.RoomID==l.RoomID&&old.lease.PlaybackID==l.PlaybackID&&
+   old.lease.Generation==l.Generation {
+   delete(s.byToken,existing)
+   close(old.convertRevoked)
+  }
+ }
+ s.byToken[secret]=entry
+ s.mu.Unlock()
+ go func(){
+  select {
+  case <-l.Done:
+  case <-entry.convertRevoked:
+  }
+  s.mu.Lock()
+  if s.byToken[secret]==entry{delete(s.byToken,secret)}
+  s.mu.Unlock()
+ }()
+ mime:="video/mp4";if profile.MediaKind=="audio"{mime="audio/mp4"}
+ return Offer{Path:"/media/convert/"+secret,ContentType:mime,MediaKind:profile.MediaKind},nil
 }
 
 func peerIP(address string) (netip.Addr,error) {
@@ -101,7 +149,9 @@ func (s *Store) Grant(lease directws.Lease, remoteAddr string) (Offer,error) {
 func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	if s==nil||s.book==nil {http.NotFound(w,r);return}
 	if r.Method!="GET" && r.Method!="HEAD" {http.Error(w,"method not allowed",405);return}
+	converted:=strings.HasPrefix(r.URL.Path,"/media/convert/")
 	secret:=strings.TrimPrefix(r.URL.Path,"/media/session/")
+	if converted {secret=strings.TrimPrefix(r.URL.Path,"/media/convert/")}
 	if len(secret)!=64 || strings.Contains(secret,"/") {
 		http.NotFound(w,r);return
 	}
@@ -111,9 +161,14 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	entry:=s.byToken[secret]
 	s.mu.Unlock()
 	if entry==nil||entry.peer!=ip||time.Now().After(entry.expires)||
-		!s.book.Valid(entry.lease.RoomID,entry.lease) {
+		!s.book.Valid(entry.lease.RoomID,entry.lease)||
+  (entry.conversion!=nil)!=converted {
 		http.NotFound(w,r);return
 	}
+ if entry.conversion!=nil {
+  s.serveConversion(w,r,entry)
+  return
+ }
 	size:=*entry.meta.SizeBytes
 	start,end,status,ok:=parseByteRange(r.Header.Get("Range"),size)
 	if !ok{
@@ -170,6 +225,57 @@ func (s *Store) ServeHTTP(w http.ResponseWriter,r *http.Request){
 	// Check revocation before every write, not just before starting the GET.
 	_,_ = io.CopyN(&firstByteReporter{ResponseWriter:w, revoked:entry.lease.Done,
 		onWrite:func(){s.emit(entry,"STREAMING","")}},reader,end-start+1)
+}
+
+// serveConversion never pretends an encoded stream has byte-offset parity
+// with its original source. Seek/range must be negotiated in a later protocol.
+func (s *Store) serveConversion(w http.ResponseWriter,r *http.Request,entry *session){
+ if s.converter==nil{http.Error(w,"converter unavailable",503);return}
+ if x:=r.Header.Get("Range");x!=""&&x!="bytes=0-" {
+  http.Error(w,"converted stream is not seekable",http.StatusRequestedRangeNotSatisfiable);return
+ }
+ mime:="video/mp4";if entry.conversion.MediaKind=="audio"{mime="audio/mp4"}
+ w.Header().Set("Content-Type",mime)
+ w.Header().Set("Cache-Control","private, no-store")
+ w.Header().Set("X-Content-Type-Options","nosniff")
+ w.Header().Set("Accept-Ranges","none")
+ if r.Method=="HEAD"{w.WriteHeader(http.StatusOK);return}
+ s.mu.Lock()
+ if entry.convertActive{s.mu.Unlock();http.Error(w,"conversion already active",http.StatusConflict);return}
+ entry.convertActive=true
+ s.mu.Unlock()
+ defer func(){s.mu.Lock();entry.convertActive=false;s.mu.Unlock()}()
+ ctx,cancel:=context.WithCancel(r.Context())
+ defer cancel()
+ finished:=make(chan struct{})
+ go func(){
+  select {
+  case <-entry.lease.Done:cancel()
+  case <-entry.convertRevoked:cancel()
+  case <-finished:
+  }
+ }()
+ defer close(finished)
+ src:=remux.Input{Size:*entry.meta.SizeBytes,Open:func(ctx context.Context,offset int64)(io.ReadCloser,error){
+  return source.OpenFromPlan(ctx,entry.token,offset,s.plans,s.factories)
+ }}
+ w.WriteHeader(http.StatusOK)
+ err:=s.converter.Run(ctx,src,*entry.conversion,&firstByteReporter{
+  ResponseWriter:flushingResponse{w},revoked:entry.lease.Done,
+  onWrite:func(){s.emit(entry,"STREAMING","")},
+ })
+ if err!=nil&&ctx.Err()==nil{s.emit(entry,"ERROR","REMUX_STREAM_ERROR")}
+}
+
+// Flush each bounded FFmpeg stdout write so the TV receives the MP4 init
+// fragment immediately, rather than waiting for net/http's internal buffer.
+type flushingResponse struct{http.ResponseWriter}
+func (w flushingResponse) Write(data []byte)(int,error){
+ n,err:=w.ResponseWriter.Write(data)
+ if n>0 {
+  if f,ok:=w.ResponseWriter.(http.Flusher);ok{f.Flush()}
+ }
+ return n,err
 }
 
 type firstByteReporter struct {

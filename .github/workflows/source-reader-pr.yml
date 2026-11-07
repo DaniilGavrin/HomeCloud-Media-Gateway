@@ -5,6 +5,7 @@ on:
       - 'internal/source/**'
       - 'internal/app/**'
       - 'internal/mediahttp/**'
+      - 'internal/remux/**'
       - 'internal/mediainspect/**'
       - 'internal/directws/**'
       - 'internal/control/**'
@@ -23,14 +24,17 @@ jobs:
           cache: true
       - name: Ensure ffprobe exists for real WAV inspection test
         run: |
-          if ! command -v ffprobe >/dev/null; then
+          if ! command -v ffprobe >/dev/null || ! command -v ffmpeg >/dev/null; then
             sudo apt-get update -qq
             sudo apt-get install -y --no-install-recommends ffmpeg
           fi
           ffprobe -version >/dev/null
+          ffmpeg -version >/dev/null
           echo "ffprobe available"
       - run: go mod verify
       - run: go test -count=1 ./...
+      - name: Exercise a real on-the-fly FFmpeg fragmented MP4 conversion
+        run: go test -count=1 -run TestRealFFmpegStreamingMP4 -v ./internal/remux
       - name: Prove real ffprobe inspected generated WAV
         run: go test -run TestKAN61FFprobeRealLoopbackRange -v ./internal/mediainspect
       - run: go test -race -count=10 ./internal/directws ./internal/mediahttp

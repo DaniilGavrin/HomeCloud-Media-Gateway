@@ -14,6 +14,8 @@ import (
 
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/directws"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
+ "github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
+ "github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/remux"
 )
 
 type testClient struct { meta source.Metadata }
@@ -181,4 +183,50 @@ func TestKAN55SwitchCancelsInFlightHTTPRange(t *testing.T){
 func (w *firstByteReporter) writeProbe() error {
 	_,err:=w.Write([]byte("stale-media"))
 	return err
+}
+
+
+func TestKAN63ConversionGrantNeedsLiveLeaseAndOutputCapability(t *testing.T){
+ s,book,lease:=createGrant(t,"video/x-matroska")
+ defer book.Close()
+ s.converter=&remux.Runner{Binary:"ffmpeg"} // only grant is exercised
+ media:=mediainspect.Media{Container:"matroska",Tracks:[]mediainspect.Track{
+  {Index:0,Kind:"video",Codec:"h264",Profile:"High",Level:40,Width:1920,Height:1080},
+  {Index:1,Kind:"audio",Codec:"dts"},
+ }}
+ cap:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{{
+  Container:"mp4",VideoCodec:"h264",AudioCodec:"aac",Certainty:"probably",
+  VideoProfiles:[]string{"High"},MaxLevel:40,MaxWidth:1920,MaxHeight:1080,
+ }}}
+ first,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1)
+ if err!=nil||!strings.HasPrefix(first.Path,"/media/convert/"){
+  t.Fatalf("grant conversion failed: %+v %v",first,err)
+ }
+ if first.ContentType!="video/mp4"||first.MediaKind!="video"{t.Fatal(first)}
+ other:=httptest.NewRequest("GET",first.Path,nil)
+ other.RemoteAddr="127.0.0.2:3123"
+ resp:=httptest.NewRecorder();s.ServeHTTP(resp,other)
+ if resp.Code!=404{t.Fatalf("other IP used conversion token: %d",resp.Code)}
+ seek:=httptest.NewRequest("GET",first.Path,nil)
+ seek.RemoteAddr="127.0.0.1:3123"
+ seek.Header.Set("Range","bytes=100-")
+ resp=httptest.NewRecorder();s.ServeHTTP(resp,seek)
+ if resp.Code!=416{t.Fatalf("pretended output byte seek: %d",resp.Code)}
+ cap.Formats[0].Certainty="maybe"
+ if _,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1);!errors.Is(err,remux.ErrUnsupported){
+  t.Fatalf("unknown TV output incorrectly authorized: %v",err)
+ }
+ cap.Formats[0].Certainty="probably"
+ second,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1)
+ if err!=nil{t.Fatal(err)}
+ if second.Path==first.Path{t.Fatal("reused a conversion URL")}
+ old:=httptest.NewRequest("HEAD",first.Path,nil)
+ old.RemoteAddr="127.0.0.1:5432"
+ oldResponse:=httptest.NewRecorder()
+ s.ServeHTTP(oldResponse,old)
+ if oldResponse.Code!=404{t.Fatalf("replaced audio URL survived: %d",oldResponse.Code)}
+ book.Remove(lease.RoomID)
+ if _,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1);err==nil{
+  t.Fatal("conversion issued after STOP")
+ }
 }
