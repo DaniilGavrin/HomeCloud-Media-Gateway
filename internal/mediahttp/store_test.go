@@ -216,6 +216,15 @@ func TestKAN63ConversionGrantNeedsLiveLeaseAndOutputCapability(t *testing.T){
  if _,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1);!errors.Is(err,remux.ErrUnsupported){
   t.Fatalf("unknown TV output incorrectly authorized: %v",err)
  }
+ cap.Formats[0].Certainty="probably"
+ second,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1)
+ if err!=nil{t.Fatal(err)}
+ if second.Path==first.Path{t.Fatal("reused a conversion URL")}
+ old:=httptest.NewRequest("HEAD",first.Path,nil)
+ old.RemoteAddr="127.0.0.1:5432"
+ oldResponse:=httptest.NewRecorder()
+ s.ServeHTTP(oldResponse,old)
+ if oldResponse.Code!=404{t.Fatalf("replaced audio URL survived: %d",oldResponse.Code)}
  book.Remove(lease.RoomID)
  if _,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1);err==nil{
   t.Fatal("conversion issued after STOP")
