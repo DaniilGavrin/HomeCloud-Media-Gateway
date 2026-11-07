@@ -12,6 +12,7 @@ import (
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/app"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/config"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/mediainspect"
+	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/remux"
 	"github.com/DaniilGavrin/HomeCloud-Media-Gateway/internal/source"
 )
 
@@ -65,6 +66,14 @@ func run() int {
 		if cfg.Inspector.Enabled {
 			service.SetMediaInspector(mediainspect.New(cfg.Inspector.Binary, coordinator.Plans, readers))
 			logger.Info("Media Inspector enabled", "binary", cfg.Inspector.Binary)
+			// KAN-63 only runs on an explicit selection from a ticket-authorized
+			// TV. Missing FFmpeg must never disable the normal HTTP Range source.
+			if converter,convErr:=remux.New("ffmpeg",1);convErr==nil {
+				service.SetConverter(converter)
+				logger.Info("FFmpeg streaming remux available","video","copy","max_concurrent",1)
+			} else {
+				logger.Warn("Streaming remux unavailable; Direct Play unaffected","error",convErr)
+			}
 		}
 		logger.Info("HCS1 remote source readers configured",
 			"nodes", len(cfg.Storage.SourceNodes), "shared_roots", len(cfg.Storage.LocalRoots))
