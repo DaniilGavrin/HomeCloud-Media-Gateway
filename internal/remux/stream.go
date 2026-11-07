@@ -124,7 +124,7 @@ func inputRange(value string,size int64)(start,end int64,status int,ok bool) {
   return size-n,size-1,http.StatusPartialContent,true
  }
  start,err:=strconv.ParseInt(parts[0],10,64)
- if err!=nil||start<0||start>=size{return}
+ if err!=nil||start<0||start>=size{return 0,0,0,false}
  end=size-1
  if parts[1]!=""{
   n,e:=strconv.ParseInt(parts[1],10,64)
