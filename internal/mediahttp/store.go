@@ -261,10 +261,21 @@ func (s *Store) serveConversion(w http.ResponseWriter,r *http.Request,entry *ses
  }}
  w.WriteHeader(http.StatusOK)
  err:=s.converter.Run(ctx,src,*entry.conversion,&firstByteReporter{
-  ResponseWriter:w,revoked:entry.lease.Done,
+  ResponseWriter:flushingResponse{w},revoked:entry.lease.Done,
   onWrite:func(){s.emit(entry,"STREAMING","")},
  })
  if err!=nil&&ctx.Err()==nil{s.emit(entry,"ERROR","REMUX_STREAM_ERROR")}
+}
+
+// Flush each bounded FFmpeg stdout write so the TV receives the MP4 init
+// fragment immediately, rather than waiting for net/http's internal buffer.
+type flushingResponse struct{http.ResponseWriter}
+func (w flushingResponse) Write(data []byte)(int,error){
+ n,err:=w.ResponseWriter.Write(data)
+ if n>0 {
+  if f,ok:=w.ResponseWriter.(http.Flusher);ok{f.Flush()}
+ }
+ return n,err
 }
 
 type firstByteReporter struct {
