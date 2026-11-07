@@ -5,6 +5,7 @@ on:
       - 'internal/source/**'
       - 'internal/app/**'
       - 'internal/mediahttp/**'
+      - 'internal/remux/**'
       - 'internal/mediainspect/**'
       - 'internal/directws/**'
       - 'internal/control/**'
@@ -31,6 +32,8 @@ jobs:
           echo "ffprobe available"
       - run: go mod verify
       - run: go test -count=1 ./...
+      - name: Exercise a real on-the-fly FFmpeg fragmented MP4 conversion
+        run: go test -count=1 -run TestRealFFmpegStreamingMP4 -v ./internal/remux
       - name: Prove real ffprobe inspected generated WAV
         run: go test -run TestKAN61FFprobeRealLoopbackRange -v ./internal/mediainspect
       - run: go test -race -count=10 ./internal/directws ./internal/mediahttp

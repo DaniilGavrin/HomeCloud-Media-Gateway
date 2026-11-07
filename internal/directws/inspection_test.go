@@ -139,3 +139,67 @@ func TestKAN61ExactTVReportUpdatesDecisionWithoutReprobe(t *testing.T){
 	if calls.Load()!=1{t.Fatal("decoding feedback reran ffprobe")}
 	book.Remove(g.RoomID)
 }
+
+
+func TestKAN63SelectionIsTrackScopedAndGenerationFenced(t *testing.T){
+ book:=New(1);defer book.Close()
+ g:=grant()
+ if err:=book.Prepare(g);err!=nil{t.Fatal(err)}
+ var calls atomic.Int32
+ h:=&Handler{Book:book,
+  OfferHTTP:func(_ Lease,_ string)(HTTPMediaOffer,error){
+   return HTTPMediaOffer{Path:"/media/session/"+strings.Repeat("a",64),ContentType:"video/mp4",MediaKind:"video"},nil
+  },
+  Inspect:func(_ context.Context,_ Lease,_ map[string]any)mediainspect.Report{
+   return mediainspect.Report{Status:"READY",Media:&mediainspect.Media{
+    Container:"matroska",Tracks:[]mediainspect.Track{
+     {Index:0,Kind:"video",Codec:"h264",Profile:"High",Level:40,Width:1920,Height:1080},
+     {Index:1,Kind:"audio",Codec:"dts"},
+     {Index:2,Kind:"audio",Codec:"aac"},
+    },
+   },Decision:mediainspect.Decision{Mode:"ADAPTIVE",Reason:"DECLARED_FORMAT_UNSUPPORTED"}}
+  },
+  OfferConversion:func(l Lease,_ string,m mediainspect.Media,caps mediainspect.TVCapabilities,index int)(HTTPMediaOffer,error){
+   calls.Add(1)
+   if l.PlaybackID!=g.PlaybackID||index!=1||len(m.Tracks)!=3||caps.Version!=1{
+    t.Error("bad inspected selection or untrusted output caps",index,caps)
+   }
+   return HTTPMediaOffer{Path:"/media/convert/"+strings.Repeat("b",64),ContentType:"video/mp4",MediaKind:"video"},nil
+  },
+ }
+ server:=httptest.NewServer(h);defer server.Close()
+ ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel()
+ ws,_,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),nil)
+ if err!=nil{t.Fatal(err)}
+ defer ws.CloseNow()
+ send:=func(m any){raw,e:=json.Marshal(m);if e!=nil{t.Fatal(e)};if e=ws.Write(ctx,websocket.MessageText,raw);e!=nil{t.Fatal(e)}}
+ recv:=func()map[string]any{
+  _,raw,e:=ws.Read(ctx);if e!=nil{t.Fatal(e)}
+  var m map[string]any;if e=json.Unmarshal(raw,&m);e!=nil{t.Fatal(e)}
+  return m
+ }
+ caps:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{{
+  Container:"mp4",VideoCodec:"h264",AudioCodec:"aac",Certainty:"probably",
+  VideoProfiles:[]string{"High"},MaxLevel:40,MaxWidth:1920,MaxHeight:1080,
+ }}}
+ helloMsg:=hello(g);helloMsg.Capabilities=map[string]any{
+  "http_range":true,"http_switch":true,"media_inspection":true,"decoder":caps,
+ }
+ send(helloMsg)
+ if m:=recv();m["type"]!="media.ready"{t.Fatal(m)}
+ if m:=recv();m["type"]!="media.inspection"{t.Fatal(m)}
+ invalid:=1_000
+ send(Hello{V:1,Type:"media.audio.select",RoomID:g.RoomID,PlaybackID:g.PlaybackID,
+  Generation:g.Generation,DeviceID:g.DeviceID,AudioIndex:&invalid})
+ if m:=recv();m["type"]!="media.convert.error"{t.Fatal(m)}
+ if calls.Load()!=0{t.Fatal("unverified index invoked converter")}
+ selected:=1
+ send(Hello{V:1,Type:"media.audio.select",RoomID:g.RoomID,PlaybackID:g.PlaybackID,
+  Generation:g.Generation,DeviceID:g.DeviceID,AudioIndex:&selected})
+ m:=recv()
+ if m["type"]!="media.convert.ready"||m["audio_index"]!=float64(1)||m["seek_supported"]!=false{
+  t.Fatalf("bad conversion offer: %v",m)
+ }
+ if calls.Load()!=1{t.Fatalf("wanted one conversion offer, got %d",calls.Load())}
+ book.Remove(g.RoomID)
+}
