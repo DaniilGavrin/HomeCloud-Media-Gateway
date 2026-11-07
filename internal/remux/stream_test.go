@@ -4,6 +4,7 @@ import (
  "bytes"
  "context"
  "errors"
+ "encoding/json"
  "io"
  "os"
  "os/exec"
@@ -99,4 +100,49 @@ func TestCancelBeforeStart(t *testing.T){
   return io.NopCloser(bytes.NewReader([]byte{1})),nil
  }},Profile{SourceFormat:"wav",VideoIndex:-1,AudioIndex:0,MediaKind:"audio"},io.Discard)
  if !errors.Is(err,context.Canceled){t.Fatalf("unexpected cancel: %v",err)}
+}
+
+
+func TestRealFFmpegCopiesH264VideoAndSelectsSecondAudioTrack(t *testing.T){
+ ffmpeg,err:=exec.LookPath("ffmpeg")
+ if err!=nil{t.Skip("ffmpeg unavailable")}
+ ffprobe,err:=exec.LookPath("ffprobe")
+ if err!=nil{t.Skip("ffprobe unavailable")}
+ // Some local CI mirrors use FFmpeg without libx264. The production code
+ // still supports H264 copy without requiring an encoder at runtime.
+ encoders,err:=exec.Command(ffmpeg,"-hide_banner","-encoders").CombinedOutput()
+ if err!=nil||!bytes.Contains(encoders,[]byte("libx264")){t.Skip("libx264 fixture encoder unavailable")}
+ dir:=t.TempDir()
+ input:=filepath.Join(dir,"two-audio-tracks.mkv")
+ create:=exec.Command(ffmpeg,"-hide_banner","-loglevel","error",
+  "-f","lavfi","-i","testsrc=size=160x90:rate=15:duration=0.8",
+  "-f","lavfi","-i","sine=frequency=440:duration=0.8",
+  "-f","lavfi","-i","sine=frequency=880:duration=0.8",
+  "-map","0:v","-map","1:a","-map","2:a",
+  "-c:v","libx264","-pix_fmt","yuv420p","-preset","ultrafast",
+  "-c:a","aac","-shortest","-f","matroska",input)
+ if output,err:=create.CombinedOutput();err!=nil{t.Fatalf("create fixture: %v: %s",err,output)}
+ raw,err:=os.ReadFile(input);if err!=nil{t.Fatal(err)}
+ profile:=Profile{SourceFormat:"matroska",VideoIndex:0,AudioIndex:2,CopyAudio:true,MediaKind:"video"}
+ runner,err:=New(ffmpeg,1);if err!=nil{t.Fatal(err)}
+ ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second)
+ defer cancel()
+ var converted bytes.Buffer
+ err=runner.Run(ctx,Input{Size:int64(len(raw)),Open:func(_ context.Context,offset int64)(io.ReadCloser,error){
+  return io.NopCloser(bytes.NewReader(raw[offset:])),nil
+ }},profile,&converted)
+ if err!=nil{t.Fatalf("fragmented copy video: %v",err)}
+ if !bytes.Contains(converted.Bytes(),[]byte("moof")){t.Fatal("no fragmented MP4 output")}
+ result:=filepath.Join(dir,"converted.mp4")
+ if err:=os.WriteFile(result,converted.Bytes(),0600);err!=nil{t.Fatal(err)}
+ probe:=exec.Command(ffprobe,"-v","error","-show_entries","stream=codec_name,codec_type",
+  "-of","json",result)
+ output,err:=probe.Output();if err!=nil{t.Fatal(err)}
+ var payload struct {Streams []struct {CodecName string `json:"codec_name"`; CodecType string `json:"codec_type"`} `json:"streams"`}
+ if err:=json.Unmarshal(output,&payload);err!=nil{t.Fatal(err)}
+ if len(payload.Streams)!=2 || payload.Streams[0].CodecName!="h264" ||
+  payload.Streams[0].CodecType!="video" || payload.Streams[1].CodecName!="aac" ||
+  payload.Streams[1].CodecType!="audio"{
+  t.Fatalf("expected exactly copied h264 + selected AAC track, got %+v",payload.Streams)
+ }
 }
