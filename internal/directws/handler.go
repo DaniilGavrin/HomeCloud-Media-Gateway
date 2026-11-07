@@ -45,6 +45,9 @@ type Handler struct {
 	// Advisory-only: expensive ffprobe runs asynchronously after media.ready.
 	// It never delays media delivery or authorizes an untrusted file reference.
 	Inspect func(context.Context,Lease,map[string]any) mediainspect.Report
+	// Converted media is offered only after room/track/output-capability
+	// validation. Ordinary HTTP Range playback is never overridden.
+	OfferConversion func(Lease,string,mediainspect.Media,mediainspect.TVCapabilities,int)(HTTPMediaOffer,error)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +211,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			if kind==websocket.MessageText && decodeErr==nil && next.Type=="media.audio.select" {
+				if !h.handleAudioSelect(r.Context(),conn,lease,next,inspection,r.RemoteAddr) {
+					_ = h.publishConversionError(r.Context(),conn,lease,"UNSUPPORTED_AUDIO_SELECTION")
+				}
+				continue
+			}
 			if kind != websocket.MessageText || decodeErr != nil ||
 				next.Type != "media.hello" || next.V != 1 ||
 				next.RoomID != lease.RoomID || next.DeviceID != lease.DeviceID ||
@@ -298,7 +307,7 @@ func (h *Handler) inspectAsync(parent context.Context,conn *websocket.Conn,lease
 		defer close(stopped)
 		report:=h.Inspect(ctx,lease,caps)
 		if ctx.Err()!=nil||!h.Book.Valid(lease.RoomID,lease){return}
-		state.Save(lease,report)
+		state.Save(lease,report,caps)
 		h.publishInspection(ctx,conn,lease,report)
 	}()
 }

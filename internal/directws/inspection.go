@@ -17,12 +17,18 @@ type inspectionState struct {
 	lease Lease
 	report mediainspect.Report
 	ready bool
+	initialCaps mediainspect.TVCapabilities
 }
-func (s *inspectionState) Save(l Lease,r mediainspect.Report){
+func (s *inspectionState) Save(l Lease,r mediainspect.Report,caps map[string]any){
 	s.mu.Lock()
 	s.lease=l
 	s.report=r
 	s.ready=true
+	// Output MP4 format support is independently reported by WebView at
+	// handshake time; an exact SOURCE report may say "unsupported".
+	raw,_:=json.Marshal(caps["decoder"])
+	var initial mediainspect.TVCapabilities
+	if len(raw)<=8192&&json.Unmarshal(raw,&initial)==nil{s.initialCaps=initial}
 	s.mu.Unlock()
 }
 func (s *inspectionState) Decide(l Lease,c mediainspect.TVCapabilities)(mediainspect.Report,bool){
@@ -40,6 +46,59 @@ func (s *inspectionState) Decide(l Lease,c mediainspect.TVCapabilities)(mediains
 	next.Decision=mediainspect.Decide(*next.Media,c)
 	s.report=next
 	return next,true
+}
+
+// Selected verifies the track belongs to the inspected active source and
+// returns the TV's declared OUTPUT capability matrix without guessing support.
+func (s *inspectionState) Selected(l Lease,index int)(mediainspect.Media,mediainspect.TVCapabilities,bool){
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready||s.report.Status!="READY"||s.report.Media==nil||
+		s.lease.RoomID!=l.RoomID||s.lease.PlaybackID!=l.PlaybackID||
+		s.lease.Generation!=l.Generation||s.lease.Epoch!=l.Epoch{
+		return mediainspect.Media{},mediainspect.TVCapabilities{},false
+	}
+	for _,track:=range s.report.Media.Tracks{
+		if track.Kind=="audio"&&track.Index==index{
+			return *s.report.Media,s.initialCaps,true
+		}
+	}
+	return mediainspect.Media{},mediainspect.TVCapabilities{},false
+}
+
+func (h *Handler) publishConversionError(ctx context.Context,conn *websocket.Conn,l Lease,code string)error{
+	raw,_:=json.Marshal(map[string]any{
+		"v":1,"type":"media.convert.error","room_id":l.RoomID,
+		"playback_id":l.PlaybackID,"generation":l.Generation,
+		"connection_epoch":l.Epoch,"code":code,
+	})
+	writeCtx,done:=context.WithTimeout(ctx,3*time.Second)
+	defer done()
+	return conn.Write(writeCtx,websocket.MessageText,raw)
+}
+
+func (h *Handler) handleAudioSelect(ctx context.Context,conn *websocket.Conn,l Lease,
+	msg Hello,state *inspectionState,peer string)bool{
+	if h.Book==nil||!h.Book.Valid(l.RoomID,l)||
+		msg.V!=1||msg.Type!="media.audio.select"||
+		msg.RoomID!=l.RoomID||msg.PlaybackID!=l.PlaybackID||
+		msg.Generation!=l.Generation||msg.DeviceID!=l.DeviceID||
+		msg.AudioIndex==nil||*msg.AudioIndex<0||*msg.AudioIndex>255||
+		h.OfferConversion==nil{return false}
+	media,caps,ok:=state.Selected(l,*msg.AudioIndex)
+	if !ok{return false}
+	offer,err:=h.OfferConversion(l,peer,media,caps,*msg.AudioIndex)
+	if err!=nil{return false}
+	raw,_:=json.Marshal(map[string]any{
+		"v":1,"type":"media.convert.ready","room_id":l.RoomID,
+		"playback_id":l.PlaybackID,"generation":l.Generation,
+		"connection_epoch":l.Epoch,"http_media_path":offer.Path,
+		"content_type":offer.ContentType,"media_kind":offer.MediaKind,
+		"audio_index":*msg.AudioIndex,"seek_supported":false,
+	})
+	writeCtx,done:=context.WithTimeout(ctx,3*time.Second)
+	defer done()
+	return conn.Write(writeCtx,websocket.MessageText,raw)==nil
 }
 
 func (h *Handler) publishInspection(ctx context.Context,conn *websocket.Conn,l Lease,r mediainspect.Report){
