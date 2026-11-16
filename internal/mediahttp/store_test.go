@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"net/http/httptest"
 	"strings"
@@ -228,5 +229,43 @@ func TestKAN63ConversionGrantNeedsLiveLeaseAndOutputCapability(t *testing.T){
  book.Remove(lease.RoomID)
  if _,err:=s.GrantConversion(lease,"127.0.0.1:2000",media,cap,1);err==nil{
   t.Fatal("conversion issued after STOP")
+ }
+}
+
+
+func TestKAN65OverloadedConversionReturns503BeforeBody(t *testing.T) {
+ s,book,lease:=createGrant(t,"video/x-matroska")
+ defer book.Close()
+ runner,err:=remux.New(os.Args[0],1) // no actual FFmpeg subprocess is launched
+ if err!=nil{t.Fatal(err)}
+ s.SetConverter(runner)
+ media:=mediainspect.Media{Container:"matroska",Tracks:[]mediainspect.Track{
+  {Index:0,Kind:"video",Codec:"h264",Profile:"High",Level:40,Width:1920,Height:1080},
+  {Index:1,Kind:"audio",Codec:"ac3"},
+ }}
+ caps:=mediainspect.TVCapabilities{Version:1,Formats:[]mediainspect.FormatSupport{{
+  Container:"mp4",VideoCodec:"h264",AudioCodec:"aac",Certainty:"probably",
+  VideoProfiles:[]string{"High"},MaxLevel:40,MaxWidth:1920,MaxHeight:1080,
+ }}}
+ offer,err:=s.GrantConversion(lease,"127.0.0.1:44001",media,caps,1)
+ if err!=nil{t.Fatal(err)}
+ first,err:=runner.TryReserve()
+ if err!=nil{t.Fatal(err)}
+ defer first.Release()
+ req:=httptest.NewRequest("GET",offer.Path,nil)
+ req.RemoteAddr="127.0.0.1:44001"
+ response:=httptest.NewRecorder()
+ s.ServeHTTP(response,req)
+ if response.Code!=http.StatusServiceUnavailable {
+  t.Fatalf("wanted HTTP 503, got %d and body %q",response.Code,response.Body.String())
+ }
+ if response.Header().Get("Retry-After")!="2"{
+  t.Fatalf("retry hint missing: %+v",response.Header())
+ }
+ if strings.Contains(response.Header().Get("Content-Type"),"video/mp4") {
+  t.Fatal("overload claimed to return valid converted video")
+ }
+ if !strings.Contains(response.Body.String(),"REMUX_BUSY"){
+  t.Fatalf("wrong diagnostic: %s",response.Body.String())
  }
 }

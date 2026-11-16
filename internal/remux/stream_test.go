@@ -174,3 +174,32 @@ func TestCopyAACOnlyWhenOutputParametersAreCompatible(t *testing.T){
   })
  }
 }
+
+
+func TestAdmissionRejectsOverCapacityImmediately(t *testing.T){
+ runner:=&Runner{Binary:"unused",slots:make(chan struct{},1)}
+ first,err:=runner.TryReserve()
+ if err!=nil{t.Fatal(err)}
+ start:=time.Now()
+ if _,err=runner.TryReserve();!errors.Is(err,ErrBusy){t.Fatalf("expected REMUX_BUSY, got %v",err)}
+ if time.Since(start)>time.Second{t.Fatal("second conversion blocked instead of failing")}
+ first.Release()
+ first.Release() // idempotent; must never deadlock
+ second,err:=runner.TryReserve()
+ if err!=nil{t.Fatalf("capacity not restored after release: %v",err)}
+ second.Release()
+}
+
+func TestPermitRejectsReusedOrReleasedReservation(t *testing.T){
+ runner:=&Runner{Binary:"unused",slots:make(chan struct{},1)}
+ permit,err:=runner.TryReserve()
+ if err!=nil{t.Fatal(err)}
+ permit.Release()
+ input:=Input{Size:1,Open:func(context.Context,int64)(io.ReadCloser,error){
+  return io.NopCloser(bytes.NewReader([]byte{1})),nil
+ }}
+ profile:=Profile{SourceFormat:"wav",VideoIndex:-1,AudioIndex:0,MediaKind:"audio"}
+ if err:=permit.Run(context.Background(),input,profile,io.Discard);!errors.Is(err,ErrPermit){
+  t.Fatalf("released permit used again: %v",err)
+ }
+}

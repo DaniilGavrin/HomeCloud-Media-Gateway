@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -245,6 +246,19 @@ func (s *Store) serveConversion(w http.ResponseWriter,r *http.Request,entry *ses
  entry.convertActive=true
  s.mu.Unlock()
  defer func(){s.mu.Lock();entry.convertActive=false;s.mu.Unlock()}()
+ // Admission happens before HTTP 200: the TV must never see a successful
+ // converted-media response when Gateway has no FFmpeg capacity.
+ permit,admissionErr:=s.converter.TryReserve()
+ if admissionErr!=nil {
+  if errors.Is(admissionErr,remux.ErrBusy) {
+   w.Header().Set("Retry-After","2")
+   http.Error(w,"REMUX_BUSY",http.StatusServiceUnavailable)
+  } else {
+   http.Error(w,"REMUX_UNAVAILABLE",http.StatusServiceUnavailable)
+  }
+  return
+ }
+ defer permit.Release()
  ctx,cancel:=context.WithCancel(r.Context())
  defer cancel()
  finished:=make(chan struct{})
@@ -260,7 +274,7 @@ func (s *Store) serveConversion(w http.ResponseWriter,r *http.Request,entry *ses
   return source.OpenFromPlan(ctx,entry.token,offset,s.plans,s.factories)
  }}
  w.WriteHeader(http.StatusOK)
- err:=s.converter.Run(ctx,src,*entry.conversion,&firstByteReporter{
+ err:=permit.Run(ctx,src,*entry.conversion,&firstByteReporter{
   ResponseWriter:flushingResponse{w},revoked:entry.lease.Done,
   onWrite:func(){s.emit(entry,"STREAMING","")},
  })
